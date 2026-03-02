@@ -11,8 +11,7 @@ const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 
 /// Pushover push notification tool.
 /// Sends notifications via the Pushover API. Requires PUSHOVER_TOKEN and
-/// PUSHOVER_USER_KEY in the workspace .env file. Registered unconditionally
-/// because credentials are resolved lazily from .env at call time.
+/// PUSHOVER_USER_KEY in the workspace .env file.
 pub const PushoverTool = struct {
     workspace_dir: []const u8,
 
