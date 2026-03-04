@@ -176,7 +176,8 @@
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,
-    "max_actions_per_hour": 20
+    "max_actions_per_hour": 20,
+    "allow_raw_url_chars": false
   },
 
   "gateway": {

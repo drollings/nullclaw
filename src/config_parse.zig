@@ -628,6 +628,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("allowed_commands")) |v| {
                 if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
             }
+            if (aut.object.get("allow_raw_url_chars")) |v| {
+                if (v == .bool) self.autonomy.allow_raw_url_chars = v.bool;
+            }
             // forbidden_paths: ignored (removed — path security handled by path_security.zig)
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
