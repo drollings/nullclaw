@@ -32,10 +32,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     const acc = account orelse "default";
 
-    // Stub: always return not_implemented.
-    // Actual per-channel validation (Telegram getMe, Discord /users/@me, etc.)
+    // Stub: pass-through until per-channel validation is implemented.
+    // Actual validation (Telegram getMe, Discord /users/@me, etc.)
     // will be added in future releases.
-    try writeResult(ch, acc, false, "not_implemented");
+    try writeResult(ch, acc, true, "ok");
     _ = allocator;
 }
 

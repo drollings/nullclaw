@@ -129,6 +129,108 @@ fn loadConfigForFromJson(allocator: std.mem.Allocator, custom_home: ?[]const u8)
     return Config.load(allocator) catch try onboard.initFreshConfig(allocator);
 }
 
+/// Apply providers from the wizard's providers array (new multi-provider format).
+/// Sets default_provider and default_model from the first entry, and creates
+/// ProviderEntry array from all entries.
+fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
+    if (items.len == 0) return;
+
+    // First entry sets default_provider and default_model
+    if (items[0] == .object) {
+        const first = items[0].object;
+        if (first.get("provider")) |v| {
+            if (v == .string) {
+                const provider_info = onboard.resolveProviderForQuickSetup(v.string) orelse {
+                    std.debug.print("error: unknown provider '{s}'\n", .{v.string});
+                    std.process.exit(1);
+                };
+                cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
+            }
+        }
+        if (first.get("model")) |v| {
+            if (v == .string and v.string.len > 0) {
+                cfg.default_model = try cfg.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
+    // Create ProviderEntry array from all entries
+    var entries_list: std.ArrayListUnmanaged(config_mod.ProviderEntry) = .empty;
+    for (items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const name = if (obj.get("provider")) |v|
+            (if (v == .string) v.string else continue)
+        else
+            continue;
+        const api_key = if (obj.get("api_key")) |v|
+            (if (v == .string and v.string.len > 0) v.string else null)
+        else
+            null;
+
+        const resolved = onboard.resolveProviderForQuickSetup(name) orelse continue;
+        try entries_list.append(cfg.allocator, .{
+            .name = try cfg.allocator.dupe(u8, resolved.key),
+            .api_key = if (api_key) |k| try cfg.allocator.dupe(u8, k) else null,
+        });
+    }
+
+    if (entries_list.items.len > 0) {
+        cfg.providers = try entries_list.toOwnedSlice(cfg.allocator);
+    }
+}
+
+/// Merge channel configurations from the wizard's JSON object into config.json.
+///
+/// Wizard sends channels as: {"telegram": {"default": {"bot_token": "..."}}}
+/// Config.json expects:       {"channels": {"telegram": {"accounts": {"default": {"bot_token": "..."}}}}}
+///
+/// After cfg.save() wrote the base config, this function reads it back,
+/// merges the wizard's channel configs (wrapped with "accounts"), and writes it back.
+fn mergeChannelsIntoConfig(allocator: std.mem.Allocator, config_path: []const u8, wizard_channels: std.json.ObjectMap) !void {
+    // Read existing config.json
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const content = try file.readToEndAlloc(allocator, 1024 * 256);
+    defer allocator.free(content);
+    file.close();
+
+    // Parse existing config as Value tree
+    const config_parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always }) catch return;
+    defer config_parsed.deinit();
+
+    if (config_parsed.value != .object) return;
+
+    // Get channels section
+    const channels_ptr = config_parsed.value.object.getPtr("channels") orelse return;
+    if (channels_ptr.* != .object) return;
+
+    // For each channel type in wizard input
+    var ch_iter = wizard_channels.iterator();
+    while (ch_iter.next()) |entry| {
+        const channel_type = entry.key_ptr.*;
+        const accounts_obj = entry.value_ptr.*;
+        if (accounts_obj != .object) continue;
+
+        // Skip cli (boolean flag, not an accounts object)
+        if (std.mem.eql(u8, channel_type, "cli")) continue;
+
+        // Wrap wizard format in "accounts" to match config.json format:
+        // {"default": {"bot_token": "..."}} → {"accounts": {"default": {"bot_token": "..."}}}
+        var channel_obj = std.json.ObjectMap.init(allocator);
+        channel_obj.put("accounts", accounts_obj) catch continue;
+
+        channels_ptr.*.object.put(channel_type, .{ .object = channel_obj }) catch continue;
+    }
+
+    // Serialize back to config.json using pretty-print
+    const json_out = std.json.Stringify.valueAlloc(allocator, config_parsed.value, .{ .whitespace = .indent_2 }) catch return;
+    defer allocator.free(json_out);
+
+    const out_file = std.fs.createFileAbsolute(config_path, .{}) catch return;
+    defer out_file.close();
+    out_file.writeAll(json_out) catch return;
+}
+
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
         std.debug.print("error: --from-json requires a JSON argument\n", .{});
@@ -148,6 +250,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer parsed.deinit();
     const answers = parsed.value;
 
+    // Raw JSON parse for providers array and channels object
+    const raw_parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        json_str,
+        .{ .allocate = .alloc_always },
+    ) catch null;
+    defer if (raw_parsed) |rp| rp.deinit();
+
     const env_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch null;
     defer if (env_home) |v| allocator.free(v);
 
@@ -158,38 +269,56 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var cfg = try loadConfigForFromJson(allocator, custom_home);
     defer cfg.deinit();
 
-    // Apply provider and API key
-    if (answers.provider) |p| {
-        const provider_info = onboard.resolveProviderForQuickSetup(p) orelse {
-            std.debug.print("error: unknown provider '{s}'\n", .{p});
-            std.process.exit(1);
-        };
-        cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
+    // Check for providers array in raw JSON (new wizard format)
+    const has_providers_array = blk: {
+        if (raw_parsed) |rp| {
+            if (rp.value == .object) {
+                if (rp.value.object.get("providers")) |prov_val| {
+                    if (prov_val == .array and prov_val.array.items.len > 0) {
+                        break :blk true;
+                    }
+                }
+            }
+        }
+        break :blk false;
+    };
 
-        if (answers.api_key) |key| {
-            // Store in providers section (same pattern as runQuickSetup)
+    if (has_providers_array) {
+        // New multi-provider format from wizard
+        const prov_arr = raw_parsed.?.value.object.get("providers").?.array;
+        try applyProvidersFromArray(&cfg, prov_arr.items);
+    } else {
+        // Legacy flat provider/api_key/model fields
+        if (answers.provider) |p| {
+            const provider_info = onboard.resolveProviderForQuickSetup(p) orelse {
+                std.debug.print("error: unknown provider '{s}'\n", .{p});
+                std.process.exit(1);
+            };
+            cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
+
+            if (answers.api_key) |key| {
+                const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+                entries[0] = .{
+                    .name = try cfg.allocator.dupe(u8, provider_info.key),
+                    .api_key = try cfg.allocator.dupe(u8, key),
+                };
+                cfg.providers = entries;
+            }
+        } else if (answers.api_key) |key| {
             const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
             entries[0] = .{
-                .name = try cfg.allocator.dupe(u8, provider_info.key),
+                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
                 .api_key = try cfg.allocator.dupe(u8, key),
             };
             cfg.providers = entries;
         }
-    } else if (answers.api_key) |key| {
-        // API key without provider change: set for the current default_provider
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{
-            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-            .api_key = try cfg.allocator.dupe(u8, key),
-        };
-        cfg.providers = entries;
-    }
 
-    // Apply model (explicit or derive from provider)
-    if (answers.model) |m| {
-        cfg.default_model = try cfg.allocator.dupe(u8, m);
-    } else if (answers.provider != null) {
-        cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
+        // Apply model (explicit or derive from provider)
+        if (answers.model) |m| {
+            cfg.default_model = try cfg.allocator.dupe(u8, m);
+        } else if (answers.provider != null) {
+            cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
+        }
     }
 
     // Apply memory backend
@@ -270,6 +399,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Save config
     try cfg.save();
+
+    // After save, merge channel configs from wizard's channels object into config.json.
+    // The channels object has format: {"telegram": {"default": {"bot_token": "..."}}}
+    // which needs wrapping with "accounts" to match config.json format.
+    if (raw_parsed) |rp| {
+        if (rp.value == .object) {
+            if (rp.value.object.get("channels")) |ch_val| {
+                if (ch_val == .object and ch_val.object.count() > 0) {
+                    mergeChannelsIntoConfig(allocator, cfg.config_path, ch_val.object) catch |err| {
+                        std.debug.print("warning: failed to merge channel configs: {s}\n", .{@errorName(err)});
+                    };
+                }
+            }
+        }
+    }
 
     // Output success as JSON to stdout
     var stdout_buf: [4096]u8 = undefined;
