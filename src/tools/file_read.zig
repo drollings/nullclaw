@@ -9,42 +9,54 @@ const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed
 /// Default maximum file size to read (10MB).
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-/// Common binary file signatures (magic numbers)
-const BinarySignatures = struct {
-    const png = "\x89PNG";
-    const jpg = "\xFF\xD8\xFF";
-    const gif = "GIF87a";
-    const gif89 = "GIF89a";
-    const pdf = "%PDF";
-    const zip = "PK\x03\x04";
-    const rar = "Rar!";
-    const sevenz = "7z\xBC\xAF\x27\x1C";
-    const exe_mz = "MZ";
-    const elf = "\x7FELF";
-    const mp4_ftyp = "ftyp";
-    const webp = "RIFF";
+/// Binary file signature entry
+const BinarySignature = struct {
+    magic: []const u8,
+    type_name: []const u8,
+};
+
+/// Known binary file signatures (magic numbers) with type names
+const BINARY_SIGNATURES: []const BinarySignature = &.{
+    .{ .magic = "\x89PNG", .type_name = "PNG image" },
+    .{ .magic = "\xFF\xD8\xFF", .type_name = "JPEG image" },
+    .{ .magic = "GIF87a", .type_name = "GIF image" },
+    .{ .magic = "GIF89a", .type_name = "GIF image" },
+    .{ .magic = "%PDF", .type_name = "PDF document" },
+    .{ .magic = "PK\x03\x04", .type_name = "ZIP archive" },
+    .{ .magic = "Rar!", .type_name = "RAR archive" },
+    .{ .magic = "7z\xBC\xAF\x27\x1C", .type_name = "7z archive" },
+    .{ .magic = "MZ", .type_name = "Windows executable" },
+    .{ .magic = "\x7FELF", .type_name = "Linux executable" },
+    .{ .magic = "RIFF", .type_name = "WebP image" },
+};
+
+/// Extension to type name mapping (fallback when magic number not detected)
+const EXTENSION_TYPES: []const struct { []const u8, []const u8 } = &.{
+    .{ ".png", "PNG image" },
+    .{ ".jpg", "JPEG image" },
+    .{ ".jpeg", "JPEG image" },
+    .{ ".gif", "GIF image" },
+    .{ ".webp", "WebP image" },
+    .{ ".pdf", "PDF document" },
+    .{ ".zip", "ZIP archive" },
+    .{ ".mp4", "MP4 video" },
+    .{ ".mp3", "MP3 audio" },
+    .{ ".wav", "WAV audio" },
+    .{ ".exe", "Windows executable" },
+    .{ ".dll", "Windows DLL" },
+    .{ ".so", "Linux shared library" },
+    .{ ".dylib", "macOS shared library" },
 };
 
 fn isBinaryContent(data: []const u8) bool {
-    if (data.len < 4) return false;
+    if (data.len < 2) return false;
 
-    // Check magic numbers
-    if (std.mem.startsWith(u8, data, BinarySignatures.png)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.jpg)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.gif)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.gif89)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.pdf)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.zip)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.rar)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.sevenz)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.exe_mz)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.elf)) return true;
-    if (std.mem.startsWith(u8, data, BinarySignatures.webp)) return true;
+    for (BINARY_SIGNATURES) |sig| {
+        if (std.mem.startsWith(u8, data, sig.magic)) return true;
+    }
 
-    // MP4: check for "ftyp" at offset 4
-    if (data.len > 8 and std.mem.indexOf(u8, data[4..12], BinarySignatures.mp4_ftyp) != null) return true;
+    if (data.len >= 12 and std.mem.indexOf(u8, data[4..12], "ftyp") != null) return true;
 
-    // Check for null bytes in first 8KB (common binary indicator)
     const check_len = @min(data.len, 8192);
     for (data[0..check_len]) |byte| {
         if (byte == 0) return true;
@@ -54,30 +66,16 @@ fn isBinaryContent(data: []const u8) bool {
 }
 
 fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, data, BinarySignatures.png)) return "PNG image";
-    if (std.mem.startsWith(u8, data, BinarySignatures.jpg)) return "JPEG image";
-    if (std.mem.startsWith(u8, data, BinarySignatures.gif)) return "GIF image";
-    if (std.mem.startsWith(u8, data, BinarySignatures.gif89)) return "GIF image";
-    if (std.mem.startsWith(u8, data, BinarySignatures.pdf)) return "PDF document";
-    if (std.mem.startsWith(u8, data, BinarySignatures.zip)) return "ZIP archive";
-    if (std.mem.startsWith(u8, data, BinarySignatures.rar)) return "RAR archive";
-    if (std.mem.startsWith(u8, data, BinarySignatures.sevenz)) return "7z archive";
-    if (std.mem.startsWith(u8, data, BinarySignatures.exe_mz)) return "Windows executable";
-    if (std.mem.startsWith(u8, data, BinarySignatures.elf)) return "Linux executable";
-    if (std.mem.startsWith(u8, data, BinarySignatures.webp)) return "WebP image";
-    if (data.len > 8 and std.mem.indexOf(u8, data[4..12], BinarySignatures.mp4_ftyp) != null) return "MP4 video";
+    for (BINARY_SIGNATURES) |sig| {
+        if (std.mem.startsWith(u8, data, sig.magic)) return sig.type_name;
+    }
 
-    // Fallback: use extension
+    if (data.len >= 12 and std.mem.indexOf(u8, data[4..12], "ftyp") != null) return "MP4 video";
+
     const ext = std.fs.path.extension(path);
-    if (std.mem.eql(u8, ext, ".png")) return "PNG image";
-    if (std.mem.eql(u8, ext, ".jpg") or std.mem.eql(u8, ext, ".jpeg")) return "JPEG image";
-    if (std.mem.eql(u8, ext, ".gif")) return "GIF image";
-    if (std.mem.eql(u8, ext, ".webp")) return "WebP image";
-    if (std.mem.eql(u8, ext, ".pdf")) return "PDF document";
-    if (std.mem.eql(u8, ext, ".zip")) return "ZIP archive";
-    if (std.mem.eql(u8, ext, ".mp4")) return "MP4 video";
-    if (std.mem.eql(u8, ext, ".mp3")) return "MP3 audio";
-    if (std.mem.eql(u8, ext, ".wav")) return "WAV audio";
+    for (EXTENSION_TYPES) |entry| {
+        if (std.mem.eql(u8, ext, entry[0])) return entry[1];
+    }
 
     return "binary file";
 }
