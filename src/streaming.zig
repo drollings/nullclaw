@@ -54,7 +54,7 @@ pub fn forwardProviderChunk(sink: Sink, chunk: providers.StreamChunk) void {
 pub const TagFilter = struct {
     inner: Sink,
     state: State = .passthrough,
-    buf: [max_tag_len]u8 = undefined,
+    buf: [max_buf_len]u8 = undefined,
     buf_len: u8 = 0,
 
     const State = enum {
@@ -70,16 +70,29 @@ pub const TagFilter = struct {
     const open_prefixes = [_][]const u8{
         "<tool_call",
         "<tool_result",
+        "<|tool_call_begin|",
+        "<|tool_result_begin|",
     };
 
     // Closing tags (fixed match).
     const close_tags = [_][]const u8{
         "</tool_call>",
         "</tool_result>",
+        "<|tool_call_end|>",
+        "<|tool_result_end|>",
     };
 
-    const max_prefix_len = 12; // "<tool_result".len
-    const max_tag_len = 14; // "</tool_result>".len
+    fn maxLen(comptime tags: []const []const u8) comptime_int {
+        var longest: usize = 0;
+        for (tags) |tag| {
+            if (tag.len > longest) longest = tag.len;
+        }
+        return longest;
+    }
+
+    const max_prefix_len = maxLen(&open_prefixes);
+    const max_tag_len = maxLen(&close_tags);
+    const max_buf_len = @max(max_prefix_len + 1, max_tag_len);
 
     pub fn init(inner: Sink) TagFilter {
         return .{ .inner = inner };
@@ -355,4 +368,26 @@ test "TagFilter incomplete open tag at end flushes on final" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("end<tool_c", col.joined(&buf));
     try std.testing.expect(col.got_final);
+}
+
+test "TagFilter strips pipe-delimited tool_call control block" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Before <|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|> after");
+    s.emitFinal();
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Before  after", col.joined(&buf));
+}
+
+test "TagFilter strips pipe-delimited tool_result block split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<|tool_result_be");
+    s.emitChunk("gin|>hidden");
+    s.emitChunk("<|tool_result_end|>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
 }
