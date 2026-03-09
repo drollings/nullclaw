@@ -467,12 +467,14 @@ pub const ReliableProvider = struct {
         root.clearLastApiErrorDetail();
 
         const needs_vision = hasImageParts(request);
+        var attempted_vision_provider = false;
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
 
         for (models) |current_model| {
             // Try primary provider (skip if it lacks vision and request needs it)
             if (!needs_vision or self.inner.supportsVisionForModel(current_model)) {
+                if (needs_vision) attempted_vision_provider = true;
                 if (self.tryChatProvider(
                     self.inner,
                     allocator,
@@ -486,6 +488,7 @@ pub const ReliableProvider = struct {
             // Try extra providers
             for (self.extras) |entry| {
                 if (!needs_vision or entry.provider.supportsVisionForModel(current_model)) {
+                    if (needs_vision) attempted_vision_provider = true;
                     if (self.tryChatProvider(
                         entry.provider,
                         allocator,
@@ -501,15 +504,8 @@ pub const ReliableProvider = struct {
         // Defensive: if we skipped everything due to vision, return a clear error.
         // Normally caught upstream by buildProviderMessages, but handled here for
         // callers that invoke chatImpl directly (e.g. tests, gateway).
-        if (needs_vision) {
-            const any_vision = blk: {
-                if (self.inner.supportsVision()) break :blk true;
-                for (self.extras) |entry| {
-                    if (entry.provider.supportsVision()) break :blk true;
-                }
-                break :blk false;
-            };
-            if (!any_vision) return error.ProviderDoesNotSupportVision;
+        if (needs_vision and !attempted_vision_provider) {
+            return error.ProviderDoesNotSupportVision;
         }
 
         return self.finalFailureError();
@@ -926,6 +922,69 @@ const ModelAwareMock = struct {
     fn modelDeinit(_: *anyopaque) void {}
 };
 
+const VisionByModelMock = struct {
+    call_count: u32 = 0,
+    vision_model: []const u8,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .supports_vision = supportsVision,
+        .supports_vision_for_model = supportsVisionForModel,
+        .getName = getName,
+        .deinit = deinit,
+    };
+
+    fn toProvider(self: *VisionByModelMock) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *VisionByModelMock = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        return "vision by model";
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!ChatResponse {
+        const self: *VisionByModelMock = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        return ChatResponse{ .content = try allocator.dupe(u8, "vision by model") };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn supportsVision(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsVisionForModel(ptr: *anyopaque, model: []const u8) bool {
+        const self: *VisionByModelMock = @ptrCast(@alignCast(ptr));
+        return std.mem.eql(u8, model, self.vision_model);
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "VisionByModelMock";
+    }
+
+    fn deinit(_: *anyopaque) void {}
+};
+
 test "ReliableProvider vtable succeeds without retry" {
     var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
     var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
@@ -1320,6 +1379,22 @@ test "chatImpl returns ProviderDoesNotSupportVision when all providers lack visi
     try std.testing.expectError(error.ProviderDoesNotSupportVision, prov.chat(std.testing.allocator, request, "codex", 0.7));
     try std.testing.expect(inner.call_count == 0);
     try std.testing.expect(extra.call_count == 0);
+}
+
+test "chatImpl returns ProviderDoesNotSupportVision when vision exists only for other models" {
+    var inner = VisionByModelMock{ .vision_model = "vision-model" };
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50);
+    const prov = reliable.provider();
+
+    const parts = [_]root.ContentPart{.{ .image_base64 = .{ .data = "abc", .media_type = "image/png" } }};
+    const msgs = [_]root.ChatMessage{.{ .role = .user, .content = "", .content_parts = &parts }};
+    const request = ChatRequest{ .messages = &msgs };
+
+    try std.testing.expectError(
+        error.ProviderDoesNotSupportVision,
+        prov.chat(std.testing.allocator, request, "text-model", 0.7),
+    );
+    try std.testing.expect(inner.call_count == 0);
 }
 
 test "streamChatImpl routes image request to vision-capable extra, skips inner" {
