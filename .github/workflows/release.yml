@@ -1,5 +1,9 @@
 name: Release
 
+env:
+  ANDROID_API_LEVEL: 24
+  ANDROID_NDK_VERSION: 29.0.14206865
+
 on:
   push:
     tags: ['v*']
@@ -17,30 +21,52 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64
             zig_target: x86_64-linux-musl
+            zig_cpu: ""
             ext: ""
           - os: ubuntu-latest
             target: linux-aarch64
             zig_target: aarch64-linux-musl
+            zig_cpu: ""
             ext: ""
           - os: ubuntu-latest
             target: linux-riscv64
             zig_target: riscv64-linux-musl
+            zig_cpu: ""
+            ext: ""
+          - os: ubuntu-latest
+            target: android-aarch64
+            zig_target: aarch64-linux-android
+            zig_cpu: ""
+            ext: ""
+          - os: ubuntu-latest
+            target: android-armv7
+            zig_target: arm-linux-androideabi
+            zig_cpu: baseline+v7a
+            ext: ""
+          - os: ubuntu-latest
+            target: android-x86_64
+            zig_target: x86_64-linux-android
+            zig_cpu: ""
             ext: ""
           - os: macos-latest
             target: macos-aarch64
             zig_target: aarch64-macos
+            zig_cpu: ""
             ext: ""
           - os: macos-latest
             target: macos-x86_64
             zig_target: x86_64-macos
+            zig_cpu: ""
             ext: ""
           - os: windows-latest
             target: windows-x86_64
             zig_target: x86_64-windows
+            zig_cpu: ""
             ext: ".exe"
           - os: windows-latest
             target: windows-aarch64
             zig_target: aarch64-windows
+            zig_cpu: ""
             ext: ".exe"
 
     steps:
@@ -51,8 +77,58 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Set up JDK 17
+        if: startsWith(matrix.target, 'android-')
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: startsWith(matrix.target, 'android-')
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: Install Android NDK
+        if: startsWith(matrix.target, 'android-')
+        run: sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Export Android NDK paths
+        if: startsWith(matrix.target, 'android-')
+        run: |
+          NDK_ROOT="${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          SYSROOT="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          LIBC_FILE="$RUNNER_TEMP/android-libc-${{ matrix.target }}.txt"
+          echo "ANDROID_NDK_ROOT=${NDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ZIG_ANDROID_SYSROOT=${SYSROOT}" >> "$GITHUB_ENV"
+          echo "ZIG_ANDROID_LIBC_FILE=${LIBC_FILE}" >> "$GITHUB_ENV"
+          cat > "${LIBC_FILE}" <<EOF
+          include_dir=${SYSROOT}/usr/include/${{ matrix.zig_target }}
+          sys_include_dir=${SYSROOT}/usr/include
+          crt_dir=${SYSROOT}/usr/lib/${{ matrix.zig_target }}/${ANDROID_API_LEVEL}
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+
       - name: Build ReleaseSmall
-        run: zig build -Doptimize=ReleaseSmall ${{ matrix.zig_target && format('-Dtarget={0}', matrix.zig_target) || '' }}
+        run: |
+          zig_target="${{ matrix.zig_target }}"
+          if [[ "${{ matrix.target }}" == android-* ]]; then
+            zig_target="${zig_target}.${ANDROID_API_LEVEL}"
+          fi
+          zig_args=(
+            -Doptimize=ReleaseSmall
+            -Dtarget=${zig_target}
+          )
+          if [ -n "${{ matrix.zig_cpu }}" ]; then
+            zig_args+=(-Dcpu=${{ matrix.zig_cpu }})
+          fi
+          if [[ "${{ matrix.target }}" == android-* ]]; then
+            zig_args+=(--libc "${ZIG_ANDROID_LIBC_FILE}")
+          fi
+          zig build "${zig_args[@]}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -74,6 +150,9 @@ jobs:
           mv nullclaw-linux-x86_64/nullclaw nullclaw-linux-x86_64.bin
           mv nullclaw-linux-aarch64/nullclaw nullclaw-linux-aarch64.bin
           mv nullclaw-linux-riscv64/nullclaw nullclaw-linux-riscv64.bin
+          mv nullclaw-android-aarch64/nullclaw nullclaw-android-aarch64.bin
+          mv nullclaw-android-armv7/nullclaw nullclaw-android-armv7.bin
+          mv nullclaw-android-x86_64/nullclaw nullclaw-android-x86_64.bin
           mv nullclaw-macos-aarch64/nullclaw nullclaw-macos-aarch64.bin
           mv nullclaw-macos-x86_64/nullclaw nullclaw-macos-x86_64.bin
           mv nullclaw-windows-x86_64/nullclaw.exe nullclaw-windows-x86_64.exe
@@ -86,6 +165,9 @@ jobs:
             nullclaw-linux-x86_64.bin
             nullclaw-linux-aarch64.bin
             nullclaw-linux-riscv64.bin
+            nullclaw-android-aarch64.bin
+            nullclaw-android-armv7.bin
+            nullclaw-android-x86_64.bin
             nullclaw-macos-aarch64.bin
             nullclaw-macos-x86_64.bin
             nullclaw-windows-x86_64.exe

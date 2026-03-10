@@ -7,7 +7,8 @@
 /// tasks that do not enter the full agent/runtime path.
 pub const COORDINATION_STACK_SIZE: usize = 64 * 1024;
 
-/// Typing indicators, heartbeats, and similarly small auxiliary loops.
+/// Typing indicators, websocket heartbeats, and similarly small auxiliary
+/// loops that do not initialize memory/runtime state.
 pub const AUXILIARY_LOOP_STACK_SIZE: usize = 128 * 1024;
 
 /// Supervisors, readers, pollers, and other medium-weight control loops.

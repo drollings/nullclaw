@@ -67,6 +67,49 @@ fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, mod
     };
 }
 
+fn parseNamedAgentObject(
+    allocator: std.mem.Allocator,
+    agent_name: []const u8,
+    item: std.json.Value,
+) !?types.NamedAgentConfig {
+    if (item != .object) return null;
+
+    const provider = item.object.get("provider") orelse return null;
+    if (provider != .string) return null;
+
+    const model_str: ?[]const u8 = blk: {
+        const m = item.object.get("model") orelse break :blk null;
+        if (m == .string) break :blk m.string;
+        if (m == .object) {
+            if (m.object.get("primary")) |mp| {
+                if (mp == .string) break :blk mp.string;
+            }
+        }
+        break :blk null;
+    };
+    if (model_str == null) return null;
+
+    var agent_cfg = types.NamedAgentConfig{
+        .name = try allocator.dupe(u8, agent_name),
+        .provider = try allocator.dupe(u8, provider.string),
+        .model = try allocator.dupe(u8, model_str.?),
+    };
+    if (item.object.get("system_prompt")) |sp| {
+        if (sp == .string) agent_cfg.system_prompt = try allocator.dupe(u8, sp.string);
+    }
+    if (item.object.get("api_key")) |ak| {
+        if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
+    }
+    if (item.object.get("temperature")) |t| {
+        if (t == .float) agent_cfg.temperature = t.float;
+        if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
+    }
+    if (item.object.get("max_depth")) |md| {
+        if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
+    }
+    return agent_cfg;
+}
+
 fn parsePeerKind(kind: []const u8) ?agent_routing.ChatType {
     if (std.mem.eql(u8, kind, "direct") or std.mem.eql(u8, kind, "dm")) return .direct;
     if (std.mem.eql(u8, kind, "group")) return .group;
@@ -511,47 +554,28 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     try list.ensureTotalCapacity(self.allocator, @intCast(list_val.array.items.len));
                     for (list_val.array.items) |item| {
                         if (item == .object) {
-                            // "id" or "name" for the agent name
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
-                            const provider = item.object.get("provider") orelse continue;
-                            if (name_val != .string or provider != .string) continue;
-
-                            // model can be string or {"primary": "..."}
-                            const model_str: ?[]const u8 = blk: {
-                                const m = item.object.get("model") orelse break :blk null;
-                                if (m == .string) break :blk m.string;
-                                if (m == .object) {
-                                    if (m.object.get("primary")) |mp| {
-                                        if (mp == .string) break :blk mp.string;
-                                    }
-                                }
-                                break :blk null;
-                            };
-                            if (model_str == null) continue;
-
-                            var agent_cfg = types.NamedAgentConfig{
-                                .name = try self.allocator.dupe(u8, name_val.string),
-                                .provider = try self.allocator.dupe(u8, provider.string),
-                                .model = try self.allocator.dupe(u8, model_str.?),
-                            };
-                            if (item.object.get("system_prompt")) |sp| {
-                                if (sp == .string) agent_cfg.system_prompt = try self.allocator.dupe(u8, sp.string);
-                            }
-                            if (item.object.get("api_key")) |ak| {
-                                if (ak == .string) agent_cfg.api_key = try self.allocator.dupe(u8, ak.string);
-                            }
-                            if (item.object.get("temperature")) |t| {
-                                if (t == .float) agent_cfg.temperature = t.float;
-                                if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
-                            }
-                            if (item.object.get("max_depth")) |md| {
-                                if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
-                            }
+                            if (name_val != .string) continue;
+                            const agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
                             try list.append(self.allocator, agent_cfg);
                         }
                     }
                     self.agents = try list.toOwnedSlice(self.allocator);
                 }
+            }
+
+            // Also accept the object-of-objects shape:
+            // "agents": { "defaults": {...}, "coder": {...}, "researcher": {...} }
+            if (self.agents.len == 0) {
+                var named_agent_list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                var it = agents_val.object.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
+                    const agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    try named_agent_list.append(self.allocator, agent_cfg);
+                }
+                self.agents = try named_agent_list.toOwnedSlice(self.allocator);
             }
         }
     }
@@ -923,6 +947,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
+            }
+            if (tl.object.get("path_env_vars")) |v| {
+                if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {

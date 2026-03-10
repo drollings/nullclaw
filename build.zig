@@ -311,6 +311,33 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
     return selection;
 }
 
+fn envExists(name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
+    std.heap.page_allocator.free(value);
+    return true;
+}
+
+fn ensureAndroidBuildEnvironment(b: *std.Build) void {
+    if (envExists("TERMUX_VERSION")) return;
+    if (b.libc_file != null) return;
+
+    const has_android_sdk_or_ndk =
+        envExists("ANDROID_NDK_HOME") or
+        envExists("ANDROID_NDK_ROOT") or
+        envExists("ANDROID_HOME") or
+        envExists("ANDROID_SDK_ROOT");
+
+    std.log.err("Android cross-builds need a Zig libc/sysroot file passed via --libc (or ZIG_LIBC).", .{});
+    if (has_android_sdk_or_ndk) {
+        std.log.err("An Android SDK/NDK environment was detected, but Zig still needs --libc pointing at the generated libc/sysroot file.", .{});
+    } else {
+        std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
+    }
+    std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
+    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
+    std.process.exit(1);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -370,6 +397,10 @@ pub fn build(b: *std.Build) void {
     const enable_channel_signal = channels.enable_channel_signal;
     const enable_channel_nostr = channels.enable_channel_nostr;
     const enable_channel_web = channels.enable_channel_web;
+
+    if (target.result.abi == .android) {
+        ensureAndroidBuildEnvironment(b);
+    }
 
     const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
     const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;

@@ -1,5 +1,9 @@
 name: CI
 
+env:
+  ANDROID_API_LEVEL: 24
+  ANDROID_NDK_VERSION: 29.0.14206865
+
 on:
   push:
     branches: [main]
@@ -35,6 +39,58 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Set up JDK 17
+        if: runner.os == 'Linux'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: runner.os == 'Linux'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: Install Android NDK
+        if: runner.os == 'Linux'
+        run: sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Export Android NDK paths
+        if: runner.os == 'Linux'
+        run: |
+          NDK_ROOT="${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          SYSROOT="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          echo "ANDROID_NDK_ROOT=${NDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ZIG_ANDROID_SYSROOT=${SYSROOT}" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/android-libc-aarch64.txt" <<EOF
+          include_dir=${SYSROOT}/usr/include/aarch64-linux-android
+          sys_include_dir=${SYSROOT}/usr/include
+          crt_dir=${SYSROOT}/usr/lib/aarch64-linux-android/${ANDROID_API_LEVEL}
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+          cat > "$RUNNER_TEMP/android-libc-armv7.txt" <<EOF
+          include_dir=${SYSROOT}/usr/include/arm-linux-androideabi
+          sys_include_dir=${SYSROOT}/usr/include
+          crt_dir=${SYSROOT}/usr/lib/arm-linux-androideabi/${ANDROID_API_LEVEL}
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+          cat > "$RUNNER_TEMP/android-libc-x86_64.txt" <<EOF
+          include_dir=${SYSROOT}/usr/include/x86_64-linux-android
+          sys_include_dir=${SYSROOT}/usr/include
+          crt_dir=${SYSROOT}/usr/lib/x86_64-linux-android/${ANDROID_API_LEVEL}
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          gcc_dir=
+          EOF
+          echo "ZIG_ANDROID_LIBC_AARCH64=$RUNNER_TEMP/android-libc-aarch64.txt" >> "$GITHUB_ENV"
+          echo "ZIG_ANDROID_LIBC_ARMV7=$RUNNER_TEMP/android-libc-armv7.txt" >> "$GITHUB_ENV"
+          echo "ZIG_ANDROID_LIBC_X86_64=$RUNNER_TEMP/android-libc-x86_64.txt" >> "$GITHUB_ENV"
+
       - name: Cache .zig-cache
         uses: actions/cache@v4
         with:
@@ -48,9 +104,26 @@ jobs:
       - name: Build ReleaseSmall
         run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSmall
 
-      - name: Cross-compile linux-aarch64 (Termux/ARM)
+      - name: Preserve host binary
+        run: |
+          mkdir -p ci-artifacts
+          cp "zig-out/bin/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}" "ci-artifacts/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}"
+
+      - name: Cross-compile linux-aarch64 (musl)
         if: runner.os == 'Linux'
         run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
+
+      - name: Cross-compile android-aarch64 (Termux)
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=aarch64-linux-android.${ANDROID_API_LEVEL} -Doptimize=ReleaseSmall --libc "${ZIG_ANDROID_LIBC_AARCH64}"
+
+      - name: Cross-compile android-armv7 (Termux)
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=arm-linux-androideabi.${ANDROID_API_LEVEL} -Dcpu=baseline+v7a -Doptimize=ReleaseSmall --libc "${ZIG_ANDROID_LIBC_ARMV7}"
+
+      - name: Cross-compile android-x86_64 (Termux)
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=x86_64-linux-android.${ANDROID_API_LEVEL} -Doptimize=ReleaseSmall --libc "${ZIG_ANDROID_LIBC_X86_64}"
 
       - name: Cross-compile linux-arm32 (glibc)
         if: runner.os == 'Linux'
@@ -75,9 +148,9 @@ jobs:
             echo "| Test MaxRSS | ${RSS:-—} |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          BIN="zig-out/bin/nullclaw"
+          BIN="ci-artifacts/nullclaw"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            BIN="zig-out/bin/nullclaw.exe"
+            BIN="ci-artifacts/nullclaw.exe"
           fi
           if [ -f "$BIN" ]; then
             SIZE=$(wc -c < "$BIN" | tr -d ' ')
@@ -90,4 +163,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nullclaw-${{ matrix.target }}
-          path: zig-out/bin/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}
+          path: ci-artifacts/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}

@@ -30,6 +30,10 @@ const log = std.log.scoped(.daemon);
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
+/// Daemon heartbeat initializes memory/bootstrap runtime state before it
+/// settles into its periodic loop, so it needs the session-turn budget.
+const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE;
+
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
 
@@ -862,7 +866,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -1885,6 +1889,10 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     }
     try std.testing.expect(found_runtime);
     try std.testing.expect(found_external);
+}
+
+test "daemon heartbeat thread stack matches session turn budget" {
+    try std.testing.expectEqual(thread_stacks.SESSION_TURN_STACK_SIZE, HEARTBEAT_THREAD_STACK_SIZE);
 }
 
 test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {

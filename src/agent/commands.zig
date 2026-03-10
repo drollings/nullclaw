@@ -13,6 +13,7 @@ const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
+const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 
 const SlashCommand = control_plane.SlashCommand;
@@ -213,7 +214,7 @@ fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
 fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
     for (self.configured_providers) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, provider_name)) return true;
+        if (provider_names.providerNamesMatchIgnoreCase(entry.name, provider_name)) return true;
     }
     return false;
 }

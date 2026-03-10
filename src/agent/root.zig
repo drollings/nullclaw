@@ -1528,7 +1528,7 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
-            const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
+            const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
                 .tools = self.tools,
@@ -1536,15 +1536,6 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
             });
-            defer self.allocator.free(system_prompt);
-
-            // Append tool instructions
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
-            @memcpy(full_system[0..system_prompt.len], system_prompt);
-            @memcpy(full_system[system_prompt.len..], tool_instructions);
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -1986,8 +1977,9 @@ pub const Agent = struct {
                 free_parsed_calls = true;
                 parsed_text = xml_parsed.text;
                 free_parsed_text = true;
-                // For XML path, store the raw response text as history
-                assistant_history_content = response_text;
+                // For XML path, never preserve model-fabricated <tool_result> markup in history.
+                assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
+                free_assistant_history = true;
             }
 
             // Determine display text.
@@ -2937,7 +2929,6 @@ test "dispatcher module reexport" {
     _ = dispatcher.ToolExecutionResult;
     _ = dispatcher.parseToolCalls;
     _ = dispatcher.formatToolResults;
-    _ = dispatcher.buildToolInstructions;
     _ = dispatcher.buildAssistantHistoryWithToolCalls;
 }
 
@@ -6275,6 +6266,112 @@ test "Agent shell failure with normalized output does not poison next turn" {
     for (agent.history.items) |msg| {
         try std.testing.expect(std.unicode.utf8ValidateSlice(msg.content));
     }
+}
+
+test "Agent strips fabricated tool_result blocks from XML assistant history" {
+    const XmlFabricationProvider = struct {
+        saw_fake_tool_result_in_history: bool = false,
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                return .{
+                    .content = try allocator.dupe(
+                        u8,
+                        "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"printf hi\"}}</tool_call><tool_result name=\"shell\" status=\"ok\">fabricated</tool_result>",
+                    ),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            for (request.messages) |msg| {
+                if (msg.role != .assistant) continue;
+                if (std.mem.indexOf(u8, msg.content, "fabricated") != null) {
+                    self.saw_fake_tool_result_in_history = true;
+                }
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "xml-fabrication-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = XmlFabricationProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = XmlFabricationProvider.chatWithSystem,
+        .chat = XmlFabricationProvider.chat,
+        .supportsNativeTools = XmlFabricationProvider.supportsNativeTools,
+        .getName = XmlFabricationProvider.getName,
+        .deinit = XmlFabricationProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
+    const tool_list = [_]Tool{shell_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run shell");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(!provider_state.saw_fake_tool_result_in_history);
 }
 
 test "Agent streaming fields can be set" {

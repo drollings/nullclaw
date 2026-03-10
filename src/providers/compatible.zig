@@ -28,6 +28,103 @@ fn logCompatibleApiError(
     log.err("{s} {s}: {s} {s}", .{ provider_name, @errorName(err), url, preview });
 }
 
+fn parseStatusCodeValue(value: std.json.Value) ?u16 {
+    return switch (value) {
+        .integer => |i| blk: {
+            if (i < 0 or i > std.math.maxInt(u16)) break :blk null;
+            break :blk @intCast(i);
+        },
+        .string => |s| std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t\r\n"), 10) catch null,
+        else => null,
+    };
+}
+
+fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
+fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (sliceEqlAsciiFold(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
+    if (root_obj.get("error")) |err_value| {
+        if (err_value == .object) {
+            const err_obj = err_value.object;
+            if (err_obj.get("status")) |status| {
+                if (parseStatusCodeValue(status)) |code| return code;
+            }
+            if (err_obj.get("code")) |code_value| {
+                if (parseStatusCodeValue(code_value)) |code| return code;
+            }
+        }
+    }
+
+    if (root_obj.get("status")) |status| {
+        if (parseStatusCodeValue(status)) |code| return code;
+    }
+    if (root_obj.get("code")) |code_value| {
+        if (parseStatusCodeValue(code_value)) |code| return code;
+    }
+
+    return null;
+}
+
+fn lookupFallbackMessage(root_obj: std.json.ObjectMap) ?[]const u8 {
+    if (root_obj.get("error")) |err_value| {
+        if (err_value == .object) {
+            const err_obj = err_value.object;
+            if (err_obj.get("message")) |message| {
+                if (message == .string) return message.string;
+            }
+        }
+    }
+
+    if (root_obj.get("message")) |message| {
+        if (message == .string) return message.string;
+    }
+
+    return null;
+}
+
+fn isResponsesFallbackMessage(message: []const u8) bool {
+    const trimmed = std.mem.trim(u8, message, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    return sliceEqlAsciiFold(trimmed, "not found") or
+        sliceEqlAsciiFold(trimmed, "404 not found") or
+        containsAsciiFold(trimmed, "unknown endpoint") or
+        containsAsciiFold(trimmed, "endpoint not found") or
+        containsAsciiFold(trimmed, "/chat/completions");
+}
+
+fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    if (error_classify.classifyKnownApiError(parsed.value.object)) |kind| {
+        if (kind != .other) return false;
+    }
+
+    const status = lookupFallbackStatusCode(parsed.value.object) orelse return false;
+    if (status != 404) return false;
+
+    const message = lookupFallbackMessage(parsed.value.object) orelse return false;
+    return isResponsesFallbackMessage(message);
+}
+
 /// How the provider expects the API key to be sent.
 pub const AuthStyle = enum {
     /// `Authorization: Bearer <key>`
@@ -54,6 +151,8 @@ pub const AuthStyle = enum {
 pub const OpenAiCompatibleProvider = struct {
     name: []const u8,
     base_url: []const u8,
+    /// Optional owned copy of base_url when the caller had to normalize/build it.
+    owned_base_url: ?[]u8 = null,
     api_key: ?[]const u8,
     auth_style: AuthStyle,
     /// Custom header name when auth_style is .custom (e.g. "X-Custom-Key").
@@ -290,6 +389,7 @@ pub const OpenAiCompatibleProvider = struct {
         system_prompt: ?[]const u8,
         message: []const u8,
         model: []const u8,
+        timeout_secs: u64,
     ) ![]const u8 {
         const url = try self.responsesUrl(allocator);
         defer allocator.free(url);
@@ -302,11 +402,24 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const resp_body = if (auth) |a| blk: {
+        var headers_buf: [2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch return error.CompatibleApiError;
-        } else root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.CompatibleApiError;
+            headers_buf[header_count] = auth_hdr;
+            header_count += 1;
+        }
+        var user_agent_hdr: ?[]u8 = null;
+        defer if (user_agent_hdr) |h| allocator.free(h);
+        if (self.user_agent) |ua| {
+            if (!validateUserAgent(ua)) return error.CompatibleApiError;
+            user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
+            headers_buf[header_count] = user_agent_hdr.?;
+            header_count += 1;
+        }
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
         return extractResponsesText(allocator, resp_body);
@@ -796,9 +909,9 @@ pub const OpenAiCompatibleProvider = struct {
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {
-            // If chat completions failed and responses fallback is enabled, try the responses API
-            if (self.supports_responses_fallback) {
-                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model) catch {
+            // Only switch protocols when chat-completions explicitly reports endpoint absence.
+            if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
+                return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model, 0) catch {
                     logCompatibleApiError(allocator, self.name, err, url, resp_body);
                     return err;
                 };
@@ -886,7 +999,13 @@ pub const OpenAiCompatibleProvider = struct {
         return self.name;
     }
 
-    fn deinitImpl(_: *anyopaque) void {}
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        if (self.owned_base_url) |owned| {
+            self.allocator.free(owned);
+            self.owned_base_url = null;
+        }
+    }
 };
 
 /// Serialize a single message's content field — delegates to shared helper in providers/helpers.zig.
@@ -1537,6 +1656,16 @@ test "responsesUrl non-v1 api path uses raw suffix" {
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/api/coding/v3/responses", url);
+}
+
+test "shouldFallbackToResponses only for explicit 404 payloads" {
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"Not found\",\"code\":404}}"));
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"status\":404,\"message\":\"unknown endpoint\"}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"No endpoints found that support image input\",\"code\":404}}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"model not found\",\"code\":404}}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "not json at all"));
 }
 
 test "responsesUrl requires exact suffix match" {
