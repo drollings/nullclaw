@@ -188,7 +188,7 @@ Rules:
 
 ### `memory`
 
-- `backend`: start with `sqlite`.
+- `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
 - `auto_save`: persists conversation memory automatically.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 
