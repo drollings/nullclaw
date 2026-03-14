@@ -36,6 +36,9 @@ const Command = enum {
     auth,
     update,
     help,
+    ast_sync,
+    ast_explore,
+    ast_explain,
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
@@ -137,6 +140,9 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
+        .{ "ast-sync", .ast_sync },
+        .{ "ast-explore", .ast_explore },
+        .{ "ast-explain", .ast_explain },
     });
     return command_map.get(arg);
 }
@@ -226,6 +232,9 @@ pub fn main() !void {
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
+        .ast_sync => try runAstSync(allocator, sub_args),
+        .ast_explore => try runAstExplore(allocator, sub_args),
+        .ast_explain => try runAstExplain(allocator, sub_args),
     }
 }
 
@@ -3668,6 +3677,201 @@ fn saveAndPrintResult(
         std.debug.print("Authenticated successfully.\n", .{});
     }
     std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+}
+
+// ---------------------------------------------------------------------------
+// AST guidance CLI handlers
+// ---------------------------------------------------------------------------
+
+const ast_explain_mod = yc.ast_explain;
+
+fn resolveWorkspace(allocator: std.mem.Allocator) ![]const u8 {
+    // 1. Try NULLCLAW_WORKSPACE env var
+    if (std.process.getEnvVarOwned(allocator, "NULLCLAW_WORKSPACE")) |ws| {
+        return ws;
+    } else |_| {}
+    // 2. Fall back to CWD
+    return std.process.getCwdAlloc(allocator);
+}
+
+fn runAstSync(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    const workspace = try resolveWorkspace(allocator);
+    defer allocator.free(workspace);
+
+    // Optional --force flag (reserved for future incremental bypass)
+    var force = false;
+    for (sub_args) |arg| {
+        if (std.mem.eql(u8, arg, "--force")) force = true;
+    }
+
+    if (comptime !ast_explain_mod.enabled) {
+        std.debug.print("ast-sync requires SQLite support (build with -Dengines=sqlite)\n", .{});
+        std.process.exit(1);
+    }
+
+    ast_explain_mod.ensureDir(workspace) catch |err| {
+        std.debug.print("Failed to create .ast-explain directory: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    const db_path = try ast_explain_mod.resolveDatabasePath(allocator, workspace);
+    defer allocator.free(db_path);
+
+    var db = ast_explain_mod.AstDb.init(allocator, db_path) catch |err| {
+        std.debug.print("Failed to open database {s}: {s}\n", .{ db_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer db.deinit();
+
+    const src_dir = try ast_explain_mod.resolveSrcDir(allocator, workspace);
+    defer allocator.free(src_dir);
+
+    const stats = db.syncFromDir(allocator, src_dir) catch |err| {
+        std.debug.print("Sync failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    std.debug.print(
+        "ast-sync complete: {d} updated, {d} skipped, {d} errors\n",
+        .{ stats.synced, stats.skipped, stats.errors },
+    );
+}
+
+fn runAstExplore(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (comptime !ast_explain_mod.enabled) {
+        std.debug.print("ast-explore requires SQLite support (build with -Dengines=sqlite)\n", .{});
+        std.process.exit(1);
+    }
+
+    var query: ?[]const u8 = null;
+    var limit: usize = 10;
+    var json_mode = false;
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            json_mode = true;
+        } else if (std.mem.eql(u8, arg, "--limit") and i + 1 < sub_args.len) {
+            i += 1;
+            limit = std.fmt.parseInt(usize, sub_args[i], 10) catch 10;
+        } else if (!std.mem.startsWith(u8, arg, "--")) {
+            query = arg;
+        }
+    }
+
+    const q = query orelse {
+        std.debug.print("Usage: nullclaw ast-explore \"<query>\" [--limit N] [--json]\n", .{});
+        std.process.exit(1);
+    };
+
+    const workspace = try resolveWorkspace(allocator);
+    defer allocator.free(workspace);
+
+    const db_path = try ast_explain_mod.resolveDatabasePath(allocator, workspace);
+    defer allocator.free(db_path);
+
+    var db = ast_explain_mod.AstDb.init(allocator, db_path) catch |err| {
+        std.debug.print("Failed to open database (run ast-sync first): {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer db.deinit();
+
+    const results = db.search(allocator, q, limit) catch |err| {
+        std.debug.print("Search failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer {
+        for (results) |r| ast_explain_mod.freeSearchResult(allocator, r);
+        allocator.free(results);
+    }
+
+    if (json_mode) {
+        printAstResultsJson(results);
+    } else {
+        printAstResultsText(q, results);
+    }
+}
+
+fn runAstExplain(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (comptime !ast_explain_mod.enabled) {
+        std.debug.print("ast-explain requires SQLite support (build with -Dengines=sqlite)\n", .{});
+        std.process.exit(1);
+    }
+
+    var query: ?[]const u8 = null;
+    var limit: usize = 5;
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--limit") and i + 1 < sub_args.len) {
+            i += 1;
+            limit = std.fmt.parseInt(usize, sub_args[i], 10) catch 5;
+        } else if (!std.mem.startsWith(u8, arg, "--")) {
+            query = arg;
+        }
+    }
+
+    const q = query orelse {
+        std.debug.print("Usage: nullclaw ast-explain \"<query>\" [--limit N]\n", .{});
+        std.process.exit(1);
+    };
+
+    const workspace = try resolveWorkspace(allocator);
+    defer allocator.free(workspace);
+
+    const db_path = try ast_explain_mod.resolveDatabasePath(allocator, workspace);
+    defer allocator.free(db_path);
+
+    var db = ast_explain_mod.AstDb.init(allocator, db_path) catch |err| {
+        std.debug.print("Failed to open database (run ast-sync first): {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer db.deinit();
+
+    const results = db.search(allocator, q, limit) catch |err| {
+        std.debug.print("Search failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer {
+        for (results) |r| ast_explain_mod.freeSearchResult(allocator, r);
+        allocator.free(results);
+    }
+
+    if (results.len == 0) {
+        std.debug.print("No results found for: {s}\n", .{q});
+        std.debug.print("Tip: run 'nullclaw ast-sync' to update the index.\n", .{});
+        return;
+    }
+
+    std.debug.print("# ast-explain: {s}\n\n", .{q});
+    printAstResultsText(q, results);
+}
+
+fn printAstResultsText(query: []const u8, results: []const ast_explain_mod.SearchResult) void {
+    if (results.len == 0) {
+        std.debug.print("No results for: {s}\n", .{query});
+        return;
+    }
+    for (results, 1..) |r, i| {
+        std.debug.print("{d}. {s} ({s}) — {s}\n", .{ i, r.name, r.node_type, r.module });
+        if (r.signature) |sig| {
+            std.debug.print("   {s}\n", .{sig});
+        }
+    }
+}
+
+fn printAstResultsJson(results: []const ast_explain_mod.SearchResult) void {
+    std.debug.print("[\n", .{});
+    for (results, 0..) |r, i| {
+        std.debug.print("  {{\"module\":\"{s}\",\"name\":\"{s}\",\"type\":\"{s}\"", .{ r.module, r.name, r.node_type });
+        if (r.signature) |sig| {
+            std.debug.print(",\"signature\":\"{s}\"", .{sig});
+        }
+        std.debug.print(",\"score\":{d:.4}}}", .{r.score});
+        if (i < results.len - 1) std.debug.print(",", .{});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("]\n", .{});
 }
 
 fn printUsage() void {

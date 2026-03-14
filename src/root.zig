@@ -57,6 +57,7 @@ pub const cron = @import("cron.zig");
 pub const health = @import("health.zig");
 pub const skills = @import("skills.zig");
 pub const tools = @import("tools/root.zig");
+pub const ast_explain = @import("ast_explain/root.zig");
 pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
 pub const observability = @import("observability.zig");
