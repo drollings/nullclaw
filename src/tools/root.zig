@@ -98,9 +98,7 @@ pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
-pub const ast_sync = @import("ast_sync.zig");
-pub const ast_explore = @import("ast_explore.zig");
-pub const ast_explain = @import("ast_explain.zig");
+pub const explain = @import("explain.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -406,18 +404,10 @@ pub fn allTools(
     mft.* = .{};
     try list.append(allocator, mft.tool());
 
-    // AST guidance tools (stateless, require SQLite; gracefully no-op when index absent)
-    const asst = try allocator.create(ast_sync.AstSyncTool);
-    asst.* = .{ .workspace_dir = workspace_dir };
-    try list.append(allocator, asst.tool());
-
-    const aset = try allocator.create(ast_explore.AstExploreTool);
-    aset.* = .{ .workspace_dir = workspace_dir };
-    try list.append(allocator, aset.tool());
-
-    const aext = try allocator.create(ast_explain.AstExplainTool);
-    aext.* = .{ .workspace_dir = workspace_dir };
-    try list.append(allocator, aext.tool());
+    // Explain tool: read-only BM25 search over pre-compiled .explain.db databases.
+    const ext = try allocator.create(explain.ExplainTool);
+    ext.* = .{ .workspace_dir = workspace_dir };
+    try list.append(allocator, ext.tool());
 
     // Delegate and schedule tools
     const dlt = try allocator.create(delegate.DelegateTool);
@@ -820,10 +810,10 @@ test "all tools includes extras when enabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
-    //        ast_sync, ast_explore, ast_explain,
+    //        explain,
     //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser = 24
-    try std.testing.expectEqual(@as(usize, 24), tools.len);
+    //        web_fetch, browser = 22
+    try std.testing.expectEqual(@as(usize, 22), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -832,9 +822,9 @@ test "all tools excludes extras when disabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
-    //        ast_sync, ast_explore, ast_explain,
-    //        delegate, schedule, spawn = 19
-    try std.testing.expectEqual(@as(usize, 19), tools.len);
+    //        explain,
+    //        delegate, schedule, spawn = 17
+    try std.testing.expectEqual(@as(usize, 17), tools.len);
 }
 
 test "all tools wires http and web_search config into tool instances" {

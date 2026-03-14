@@ -99,6 +99,7 @@ pub const DmScope = config_types.DmScope;
 pub const IdentityLink = config_types.IdentityLink;
 pub const SessionConfig = config_types.SessionConfig;
 pub const NostrConfig = config_types.NostrConfig;
+pub const ExplainConfig = config_types.ExplainConfig;
 
 const SerializedNamedAgentConfig = struct {
     name: []const u8,
@@ -173,6 +174,7 @@ pub const Config = struct {
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
     session: SessionConfig = .{},
+    explain: ExplainConfig = .{},
 
     // Convenience aliases for backward-compat flat access used by other modules.
     // These are set during load() to mirror nested values.

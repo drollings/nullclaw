@@ -1630,3 +1630,42 @@ test "HttpRequestConfig fallback provider validation disallows auto" {
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
 }
+
+// ── Explain Config ──────────────────────────────────────────────
+
+/// Configuration for the `explain` tool — local-LLM-powered codebase exploration.
+///
+/// The `explain` tool searches pre-compiled `.explain.db` SQLite FTS5 databases
+/// (generated externally by `make explain-sync` in the ast-guidance repo).
+/// When `enabled` is true, search results are summarized by a *local* inference
+/// endpoint, keeping code metadata on-device and away from frontier models.
+pub const ExplainConfig = struct {
+    /// Enable local LLM summarization of explain results.
+    /// Default: false (results returned as-is without AI summary).
+    enabled: bool = false,
+    /// Provider name for local inference (e.g. "ollama", "lmstudio", "localai").
+    /// Must match a key registered in the providers factory.
+    provider: []const u8 = "ollama",
+    /// Model name for explain summarization.
+    model: []const u8 = "qwen2.5-coder:7b",
+    /// Base URL for local inference API.
+    /// Defaults to http://localhost:11434/v1 when provider is "ollama".
+    base_url: ?[]const u8 = null,
+    /// API key (rarely needed for local inference, but supported for
+    /// LM Studio / vLLM deployments that require one).
+    api_key: ?[]const u8 = null,
+    /// Maximum tokens for the explanation summary.
+    max_tokens: u32 = 512,
+    /// Sampling temperature for summarization (lower = more deterministic).
+    temperature: f32 = 0.3,
+};
+
+test "ExplainConfig defaults" {
+    const cfg: ExplainConfig = .{};
+    try std.testing.expect(!cfg.enabled);
+    try std.testing.expectEqualStrings("ollama", cfg.provider);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", cfg.model);
+    try std.testing.expect(cfg.base_url == null);
+    try std.testing.expectEqual(@as(u32, 512), cfg.max_tokens);
+    try std.testing.expectEqual(@as(f32, 0.3), cfg.temperature);
+}
