@@ -99,6 +99,7 @@ pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 pub const explain = @import("explain.zig");
+pub const explain_link = @import("explain_link.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -300,6 +301,11 @@ pub fn allTools(
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
         backend_name: []const u8 = "hybrid",
+        /// Optional explain config for local-LLM summarization in ExplainTool.
+        explain_config: ?@import("../config_types.zig").ExplainConfig = null,
+        /// Optional path to .explain.db for DelegateTool context enrichment.
+        /// When set, delegate subagents receive relevant codebase context.
+        explain_db_path: ?[]const u8 = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -406,8 +412,16 @@ pub fn allTools(
 
     // Explain tool: read-only BM25 search over pre-compiled .explain.db databases.
     const ext = try allocator.create(explain.ExplainTool);
-    ext.* = .{ .workspace_dir = workspace_dir };
+    ext.* = .{
+        .workspace_dir = workspace_dir,
+        .explain_config = opts.explain_config,
+    };
     try list.append(allocator, ext.tool());
+
+    // explain_link: link explain results to a memory entry.
+    const elt = try allocator.create(explain_link.ExplainLinkTool);
+    elt.* = .{ .workspace_dir = workspace_dir };
+    try list.append(allocator, elt.tool());
 
     // Delegate and schedule tools
     const dlt = try allocator.create(delegate.DelegateTool);
@@ -416,6 +430,7 @@ pub fn allTools(
         .configured_providers = opts.configured_providers,
         .fallback_api_key = opts.fallback_api_key,
         .depth = opts.delegate_depth,
+        .explain_db_path = opts.explain_db_path,
     };
     try list.append(allocator, dlt.tool());
 
@@ -521,6 +536,9 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
         } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
+        } else if (t.vtable == &explain_link.ExplainLinkTool.vtable) {
+            const mt: *explain_link.ExplainLinkTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem = memory;
         }
     }
 }
@@ -813,7 +831,7 @@ test "all tools includes extras when enabled" {
     //        explain,
     //        delegate, schedule, spawn, pushover, http_request, web_search,
     //        web_fetch, browser = 22
-    try std.testing.expectEqual(@as(usize, 22), tools.len);
+    try std.testing.expectEqual(@as(usize, 23), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -824,7 +842,7 @@ test "all tools excludes extras when disabled" {
     //        memory_store, memory_recall, memory_list, memory_forget,
     //        explain,
     //        delegate, schedule, spawn = 17
-    try std.testing.expectEqual(@as(usize, 17), tools.len);
+    try std.testing.expectEqual(@as(usize, 18), tools.len);
 }
 
 test "all tools wires http and web_search config into tool instances" {

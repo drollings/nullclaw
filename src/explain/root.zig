@@ -38,6 +38,7 @@ pub const enabled = build_options.enable_sqlite;
 // ---------------------------------------------------------------------------
 
 pub const staged = @import("staged.zig");
+pub const summarize = @import("summarize.zig");
 
 // ---------------------------------------------------------------------------
 // SQLite C bindings (shared with memory/engines/sqlite.zig)

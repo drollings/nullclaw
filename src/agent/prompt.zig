@@ -149,6 +149,9 @@ pub const PromptContext = struct {
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
     bootstrap_provider: ?BootstrapProvider = null,
+    /// True when .explain.db is present in the workspace.
+    /// Enables explain-first guidance and planning hints in the system prompt.
+    has_explain_db: bool = false,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -344,10 +347,59 @@ pub fn buildSystemPrompt(
         ctx.model_name,
     });
 
+    // Explain-first codebase exploration guidance (only when .explain.db is present).
+    if (ctx.has_explain_db) {
+        try appendExplainFirstGuidance(w);
+        try appendPlanningGuidance(w);
+    }
+
     // Tool use protocol and available tools
     try writeToolInstructionsSection(w, ctx.tools);
 
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Append explain-first codebase exploration guidance.
+/// Called only when `.explain.db` is present in the workspace.
+fn appendExplainFirstGuidance(w: anytype) !void {
+    try w.writeAll(
+        \\## Codebase Exploration
+        \\
+        \\This workspace has a `.explain.db` index. Prefer the `explain` tool for codebase discovery:
+        \\
+        \\- Understanding function/module structure before editing
+        \\- Finding related code locations for a symbol or concept
+        \\- Discovering dependencies and callers (`used_by` field)
+        \\
+        \\**Pattern — use `explain` FIRST, then `file_read`/`file_read_hashed` for exact details:**
+        \\1. `explain "functionName"` → get overview, signatures, `used_by`
+        \\2. Extract relevant source paths from results
+        \\3. `file_read` only when you need the exact current code
+        \\
+        \\If `explain` returns no results, fall back to `file_read` or `shell` (e.g. `grep`).
+        \\
+    );
+}
+
+/// Append planning-phase guidance for code-focused tasks.
+/// Called only when `.explain.db` is present in the workspace.
+fn appendPlanningGuidance(w: anytype) !void {
+    try w.writeAll(
+        \\## Task Planning with Explain
+        \\
+        \\For complex tasks involving code understanding or modification:
+        \\1. **Explore first**: `explain` with relevant terms to understand structure.
+        \\2. **Identify files**: Use results to locate relevant source files.
+        \\3. **Verify details**: `file_read_hashed` to confirm exact implementations.
+        \\4. **Plan edits**: Based on explain output, plan minimal targeted changes.
+        \\
+        \\Example:
+        \\> User: "Add logging to the authentication module"
+        \\> 1. `explain "authentication"` → find `auth/login.zig`, `auth/session.zig`
+        \\> 2. `file_read_hashed "auth/login.zig"` → see current implementation
+        \\> 3. Plan: add logging at entry points identified by explain
+        \\
+    );
 }
 
 fn buildIdentitySection(

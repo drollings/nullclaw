@@ -314,6 +314,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = cfg.memory.backend,
+        .explain_config = cfg.explain,
+        .explain_db_path = @import("../explain/root.zig").resolveDatabasePath(allocator, cfg.workspace_dir) catch null,
     });
     defer tools_mod.deinitTools(allocator, tools);
 

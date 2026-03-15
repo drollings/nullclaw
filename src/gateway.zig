@@ -3527,6 +3527,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,
                     .backend_name = cfg.memory.backend,
+                    .explain_config = cfg.explain,
+                    .explain_db_path = @import("explain/root.zig").resolveDatabasePath(allocator, cfg.workspace_dir) catch null,
                 }) catch &.{};
 
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);

@@ -2639,6 +2639,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = config.memory.backend,
+        .explain_config = config.explain,
+        .explain_db_path = yc.explain.resolveDatabasePath(allocator, config.workspace_dir) catch null,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
@@ -3176,6 +3178,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = config.memory.backend,
+        .explain_config = config.explain,
+        .explain_db_path = yc.explain.resolveDatabasePath(allocator, config.workspace_dir) catch null,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 

@@ -27,6 +27,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const verbose_mod = @import("../verbose.zig");
+const explain_mod = @import("../explain/root.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -1573,6 +1574,16 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
+            // Detect .explain.db presence for explain-first prompt guidance.
+            // Guard: only attempt when workspace_dir is absolute to avoid
+            // openFileAbsolute panics on relative paths (e.g. "." in tests).
+            const explain_db_path_opt = if (std.fs.path.isAbsolute(self.workspace_dir))
+                explain_mod.resolveDatabasePath(self.allocator, self.workspace_dir) catch null
+            else
+                null;
+            const has_explain_db = explain_db_path_opt != null;
+            if (explain_db_path_opt) |p| self.allocator.free(p);
+
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
@@ -1580,6 +1591,7 @@ pub const Agent = struct {
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
+                .has_explain_db = has_explain_db,
             });
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {

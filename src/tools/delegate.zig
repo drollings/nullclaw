@@ -8,6 +8,8 @@ const Config = @import("../config.zig").Config;
 const NamedAgentConfig = @import("../config.zig").NamedAgentConfig;
 const ProviderEntry = @import("../config_types.zig").ProviderEntry;
 const provider_names = @import("../provider_names.zig");
+const explain_mod = @import("../explain/root.zig");
+const explain_staged = explain_mod.staged;
 const providers = @import("../providers/root.zig");
 
 const TestCompleteFn = *const fn (
@@ -37,6 +39,10 @@ pub const DelegateTool = struct {
     fallback_api_key: ?[]const u8 = null,
     /// Current delegation depth. Incremented for sub-delegates.
     depth: u32 = 0,
+    /// Optional path to .explain.db for pre-fetching codebase context for subagents.
+    /// When set, relevant context is prepended to the delegated prompt so the
+    /// subagent has codebase awareness without an extra cold-start exploration.
+    explain_db_path: ?[]const u8 = null,
 
     pub const tool_name = "delegate";
     pub const tool_description = "Delegate a subtask to a specialized agent. Use when a task benefits from a different model.";
@@ -92,13 +98,32 @@ pub const DelegateTool = struct {
             }
         }
 
-        // Build the full prompt with optional context
-        const full_prompt = if (context) |ctx|
-            std.fmt.allocPrint(allocator, "Context: {s}\n\n{s}", .{ ctx, trimmed_prompt }) catch
-                return ToolResult.fail("Failed to build prompt")
+        // Optionally pre-fetch explain context for the subagent.
+        const explain_context = if (self.explain_db_path) |db_path|
+            fetchExplainContext(allocator, db_path, trimmed_prompt) catch null
         else
-            trimmed_prompt;
-        defer if (context != null) allocator.free(full_prompt);
+            null;
+        defer if (explain_context) |ec| allocator.free(ec);
+
+        // Build the full prompt with optional context and explain enrichment.
+        const full_prompt = blk: {
+            if (context != null or explain_context != null) {
+                var parts: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer parts.deinit(allocator);
+                const pw = parts.writer(allocator);
+                if (explain_context) |ec| {
+                    try pw.print("{s}\n\n", .{ec});
+                }
+                if (context) |ctx| {
+                    try pw.print("Context: {s}\n\n", .{ctx});
+                }
+                try pw.writeAll(trimmed_prompt);
+                break :blk try parts.toOwnedSlice(allocator);
+            }
+            break :blk trimmed_prompt;
+        };
+        const full_prompt_owned = context != null or explain_context != null;
+        defer if (full_prompt_owned) allocator.free(full_prompt);
 
         // Determine system prompt, API key, provider, model from agent config or defaults
         if (agent_cfg) |ac| {
@@ -208,6 +233,53 @@ pub const DelegateTool = struct {
         );
     }
 };
+
+/// Fetch a concise explain context block for the given task description.
+/// Opens the database, extracts keywords from the task, and returns a formatted
+/// markdown block summarising the most relevant results.
+/// Caller owns the returned string.  Returns null on any failure.
+fn fetchExplainContext(
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+    task: []const u8,
+) !?[]const u8 {
+    if (comptime !explain_mod.enabled) return null;
+
+    var db = explain_mod.ExplainDb.init(allocator, db_path) catch return null;
+    defer db.deinit();
+
+    // Use the full task text as the explain query (the FTS engine handles it well).
+    // Limit to 5 results to keep context compact.
+    const MAX_CONTEXT_RESULTS: usize = 5;
+    const query = if (task.len > 200) task[0..200] else task;
+    const results = db.search(allocator, query, MAX_CONTEXT_RESULTS) catch return null;
+    defer {
+        for (results) |r| explain_mod.freeSearchResult(allocator, r);
+        allocator.free(results);
+    }
+
+    if (results.len == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("## Relevant Codebase Context\n\n");
+    for (results) |r| {
+        try w.print("- **{s}** ({s})", .{ r.name, r.node_type });
+        if (r.signature) |sig| try w.print(": `{s}`", .{sig});
+        try w.writeByte('\n');
+        if (r.comment) |c| {
+            const excerpt = if (c.len > 120) c[0..120] else c;
+            try w.print("  {s}\n", .{excerpt});
+        }
+        try w.print("  Source: {s}\n", .{r.file_path});
+    }
+    try w.writeByte('\n');
+
+    const owned = try buf.toOwnedSlice(allocator);
+    return owned;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 var test_expected_provider_name: ?[]const u8 = null;

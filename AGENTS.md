@@ -14,6 +14,30 @@ explain-gen check
 
 Config: `.explain-gen/explain-gen-config.json`
 
+### In-Agent `explain` Tool (NullClaw)
+
+When a `.explain.db` index exists, NullClaw exposes an `explain` tool directly to the
+agent. Use it as the **first step** for any codebase exploration task:
+
+```
+explain "functionName"          # find signatures, callers, source locations
+explain "AuthProvider"          # find a type definition and its usages
+explain "session management"    # free-text search across all indexed symbols
+```
+
+**Explain-first pattern:**
+1. `explain "<term>"` → get overview, source paths, used_by references
+2. If results found, note relevant source files
+3. `file_read` / `file_read_hashed` for exact implementation details
+4. Proceed with edits using `file_edit` / `file_edit_hashed`
+
+**Fallback:** If `explain` returns no results, proceed directly with `file_read` or `shell`.
+
+**Integration points:**
+- System prompt contains explain-first guidance when `.explain.db` is present.
+- `delegate` tool passes relevant explain context to subagents.
+- `explain_link` tool: store explain results as a named memory entry for future recall.
+
 ---
 
 ## 1) Project Snapshot (Read First)

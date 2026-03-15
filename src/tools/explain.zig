@@ -5,6 +5,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const explain_mod = @import("../explain/root.zig");
 const explain_staged = explain_mod.staged;
+const explain_summarize = explain_mod.summarize;
+const ExplainConfig = @import("../config_types.zig").ExplainConfig;
 
 /// MCP tool: search the pre-compiled AST guidance index (`.explain.db`).
 ///
@@ -15,6 +17,9 @@ const explain_staged = explain_mod.staged;
 /// Optional local LLM summarization is controlled by `config.explain.enabled`.
 pub const ExplainTool = struct {
     workspace_dir: []const u8,
+    /// Optional local-LLM summarization config.  When set and `enabled = true`,
+    /// explain results are summarized before being returned to the agent.
+    explain_config: ?ExplainConfig = null,
 
     pub const tool_name = "explain";
     pub const tool_description =
@@ -90,6 +95,16 @@ pub const ExplainTool = struct {
                 .{query},
             );
             return ToolResult{ .success = true, .output = msg };
+        }
+
+        // Optional local-LLM summarization: summarize results when configured and enabled.
+        if (self.explain_config) |cfg| {
+            if (cfg.enabled) {
+                if (explain_summarize.summarizeResults(allocator, query, stages, cfg)) |summary| {
+                    return ToolResult{ .success = true, .output = summary };
+                }
+                // On failure, fall through to raw staged output below.
+            }
         }
 
         const output = try explain_staged.formatStaged(allocator, query, stages, null, self.workspace_dir);
