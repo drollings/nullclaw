@@ -2795,11 +2795,6 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
 }
 
 fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
-        return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
-    };
-    defer skills_mod.freeSkills(self.allocator, skills);
-
     const parsed = splitFirstToken(arg);
     const action_or_name = parsed.head;
 
@@ -2810,6 +2805,11 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         invalidateSystemPromptCache(self);
         return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
     }
+
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
+        return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
+    };
+    defer skills_mod.freeSkills(self.allocator, skills);
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
         if (skills.len == 0) {

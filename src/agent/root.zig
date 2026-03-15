@@ -6346,8 +6346,19 @@ test "direct slash skill command reports ambiguity between exact and composite m
 
 test "slash /skill reload invalidates prompt caches" {
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("skills/broken");
+    {
+        const f = try tmp.dir.createFile("skills/broken/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{ invalid json");
+    }
+
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
 
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = true;
