@@ -3,6 +3,17 @@
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
+---
+
+## explain-gen for AST-guided code navigation (IMPORTANT!)
+
+```
+explain-gen init
+explain-gen check
+```
+
+Config: `.explain-gen/explain-gen-config.json`
+
 ## 1) Project Snapshot (Read First)
 
 nullclaw is a Zig-first autonomous AI assistant runtime optimized for:

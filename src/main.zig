@@ -97,7 +97,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  models <{s}> [ARGS]
     \\  auth <{s}> <provider> [--import-codex]
     \\  update [--check] [--yes]
-    \\  explain "<query>" [--limit N] [--json] [--no-llm] [--workspace PATH]
+    \\  explain      "<query>" [--limit N] [--no-llm] [--workspace PATH] [--explain-db PATH]
     \\
 ,
     .{
@@ -3680,6 +3680,7 @@ fn saveAndPrintResult(
 // ---------------------------------------------------------------------------
 
 const explain_mod = yc.explain;
+const explain_staged = explain_mod.staged;
 
 fn resolveWorkspace(allocator: std.mem.Allocator) ![]const u8 {
     // 1. Try NULLCLAW_WORKSPACE env var
@@ -3698,16 +3699,13 @@ fn runExplain(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
     var query: ?[]const u8 = null;
     var limit: usize = 10;
-    var json_mode = false;
-    var no_llm = false;
     var workspace_override: ?[]const u8 = null;
+    var explain_db_override: ?[]const u8 = null;
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "--json")) {
-            json_mode = true;
-        } else if (std.mem.eql(u8, arg, "--no-llm")) {
-            no_llm = true;
+        if (std.mem.eql(u8, arg, "--no-llm")) {
+            // accepted for forward compatibility; LLM summarization not yet wired
         } else if (std.mem.eql(u8, arg, "--limit") and i + 1 < sub_args.len) {
             i += 1;
             limit = std.fmt.parseInt(usize, sub_args[i], 10) catch 10;
@@ -3715,6 +3713,9 @@ fn runExplain(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         } else if (std.mem.eql(u8, arg, "--workspace") and i + 1 < sub_args.len) {
             i += 1;
             workspace_override = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--explain-db") and i + 1 < sub_args.len) {
+            i += 1;
+            explain_db_override = sub_args[i];
         } else if (!std.mem.startsWith(u8, arg, "--")) {
             query = arg;
         }
@@ -3725,10 +3726,10 @@ fn runExplain(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Usage: nullclaw explain "<query>" [options]
             \\
             \\OPTIONS:
-            \\  --limit N          Max results (default: 10, max: 50)
-            \\  --json             Output raw JSON results
-            \\  --no-llm           Skip local LLM summarization
-            \\  --workspace PATH   Override workspace directory
+            \\  --limit N            Max results (default: 10, max: 50)
+            \\  --no-llm             Skip local LLM summarization
+            \\  --workspace PATH     Override workspace directory
+            \\  --explain-db PATH    Path to .explain.db (relative or absolute)
             \\
         , .{});
         std.process.exit(1);
@@ -3740,8 +3741,16 @@ fn runExplain(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         try resolveWorkspace(allocator);
     defer allocator.free(workspace);
 
-    // Resolve database path (env var → .explain.db → legacy path).
-    const db_path = explain_mod.resolveDatabasePath(allocator, workspace) catch |err| {
+    // Resolve database path:
+    //   1. --explain-db CLI flag (relative paths resolved against workspace)
+    //   2. NULLCLAW_EXPLAIN_DB env var / .explain.db / legacy path
+    const db_path: []u8 = if (explain_db_override) |override| blk: {
+        if (std.fs.path.isAbsolute(override)) {
+            break :blk try allocator.dupe(u8, override);
+        } else {
+            break :blk try std.fs.path.join(allocator, &.{ workspace, override });
+        }
+    } else explain_mod.resolveDatabasePath(allocator, workspace) catch |err| {
         if (err == error.DbNotFound) {
             const msg = try explain_mod.missingDbMessage(allocator, workspace);
             defer allocator.free(msg);
@@ -3765,71 +3774,31 @@ fn runExplain(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer db.deinit();
 
-    const results = db.search(allocator, q, limit) catch |err| {
+    const stages = explain_staged.executeStaged(allocator, &db, q, workspace) catch |err| {
         std.debug.print("Search failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer {
-        for (results) |r| explain_mod.freeSearchResult(allocator, r);
-        allocator.free(results);
+        explain_mod.freeStages(allocator, stages);
+        allocator.free(stages);
     }
 
-    if (results.len == 0) {
+    if (stages.len == 0) {
         std.debug.print("No results found for: {s}\n", .{q});
-        std.debug.print("Tip: broaden your search terms, or run 'make explain-sync' in ast-guidance.\n", .{});
+        std.debug.print("Tip: broaden your search terms, or run explain-gen to rebuild the index.\n", .{});
         return;
     }
 
-    if (json_mode) {
-        printExplainResultsJson(q, results);
-    } else {
-        printExplainResultsText(q, results);
-    }
+    const output = explain_staged.formatStaged(allocator, q, stages, null, workspace) catch |err| {
+        std.debug.print("Failed to format results: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.free(output);
 
-    // Local LLM summarization placeholder — invoked when config.explain.enabled
-    // and --no-llm is not set.  The summarization call is deferred to Milestone 3
-    // provider integration; this flag is accepted now so the CLI surface is complete.
-    if (no_llm) {
-        // Explicitly requested: skip local LLM. Nothing to do — raw results already printed.
-    }
-}
-
-fn printExplainResultsText(query: []const u8, results: []const explain_mod.SearchResult) void {
-    std.debug.print("# Explain: {s}\n\n", .{query});
-    for (results, 1..) |r, idx| {
-        std.debug.print("{d}. **{s}** ({s}) — {s}", .{ idx, r.name, r.node_type, r.module });
-        if (r.line) |ln| std.debug.print(":{d}", .{ln});
-        std.debug.print("\n", .{});
-        if (r.comment) |comment| {
-            const nl = std.mem.indexOfScalar(u8, comment, '\n') orelse comment.len;
-            std.debug.print("   {s}\n", .{comment[0..@min(nl, 120)]});
-        }
-        if (r.signature) |sig| {
-            std.debug.print("   `{s}`\n", .{sig});
-        }
-        if (r.used_by) |ub| {
-            if (ub.len > 2) std.debug.print("   Used by: {s}\n", .{ub});
-        }
-        std.debug.print("\n", .{});
-    }
-}
-
-fn printExplainResultsJson(query: []const u8, results: []const explain_mod.SearchResult) void {
-    std.debug.print("{{\"query\":\"{s}\",\"results\":[\n", .{query});
-    for (results, 0..) |r, i| {
-        std.debug.print("  {{\"module\":\"{s}\",\"name\":\"{s}\",\"type\":\"{s}\"", .{ r.module, r.name, r.node_type });
-        if (r.signature) |sig| std.debug.print(",\"signature\":\"{s}\"", .{sig});
-        if (r.comment) |comment| {
-            const nl = std.mem.indexOfScalar(u8, comment, '\n') orelse comment.len;
-            std.debug.print(",\"comment\":\"{s}\"", .{comment[0..@min(nl, 120)]});
-        }
-        if (r.line) |ln| std.debug.print(",\"line\":{d}", .{ln});
-        if (r.used_by) |ub| std.debug.print(",\"used_by\":{s}", .{ub});
-        std.debug.print(",\"score\":{d:.4}}}", .{r.score});
-        if (i < results.len - 1) std.debug.print(",", .{});
-        std.debug.print("\n", .{});
-    }
-    std.debug.print("]}}\n", .{});
+    var buf: [256]u8 = undefined;
+    var bw = std.fs.File.stdout().writer(&buf);
+    bw.interface.print("{s}", .{output}) catch {};
+    bw.interface.flush() catch {};
 }
 
 fn printUsage() void {

@@ -1,7 +1,7 @@
 //! explain — Read-only BM25 search over pre-compiled `.explain.db` SQLite databases.
 //!
-//! NullClaw is a *consumer* of `.explain.db` files.  All indexing and sync work
-//! is performed externally by the ast-guidance Makefile (`make explain-sync`).
+//! NullClaw is a *consumer* of `.explain.db` files produced by explain-gen.
+//! All indexing and sync work is performed externally by explain-gen.
 //!
 //! Public API:
 //!   resolveDatabasePath(allocator, workspace_dir) -> []u8
@@ -12,11 +12,14 @@
 //!   ExplainDb.init(allocator, db_path)  — open existing database (read-only)
 //!   ExplainDb.deinit()                  — close the database
 //!   ExplainDb.search(allocator, query, limit) -> []SearchResult
+//!   ExplainDb.searchWithAliases(allocator, query, limit, aliases) -> []SearchResult
 //!   freeSearchResult(allocator, r)      — free an individual result
 //!
-//! Schema for .explain.db (created by ast-guidance):
-//!   ast_nodes(id, file_path, module, node_type, name, signature,
-//!             comment, line, used_by, last_modified)
+//!   loadSemanticAliases(allocator, path) -> ?SemanticAliases
+//!
+//! Schema for .explain.db (created by explain-gen):
+//!   ast_nodes(id, file_path, source, module, node_type, name, signature,
+//!             comment, line, used_by, language, file_type, file_hash, last_modified)
 //!   fts_search USING fts5(name, comment, module, signature,
 //!                          content='ast_nodes', content_rowid='id')
 
@@ -31,6 +34,12 @@ const log = std.log.scoped(.explain);
 pub const enabled = build_options.enable_sqlite;
 
 // ---------------------------------------------------------------------------
+// Sub-module: staged explain pipeline
+// ---------------------------------------------------------------------------
+
+pub const staged = @import("staged.zig");
+
+// ---------------------------------------------------------------------------
 // SQLite C bindings (shared with memory/engines/sqlite.zig)
 // ---------------------------------------------------------------------------
 
@@ -42,30 +51,210 @@ pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 const BUSY_TIMEOUT_MS: c_int = 5000;
 
 // ---------------------------------------------------------------------------
+// Stage types (used by the staged explain pipeline in staged.zig)
+// ---------------------------------------------------------------------------
+
+/// Classifies the kind of content in a Stage.
+pub const StageKind = enum {
+    /// Human-readable explanation from module or member comment.
+    prose,
+    /// Verbatim source code excerpt.  Never altered by LLM.
+    code,
+    /// Structured metadata: keywords, see_also, skills from guidance JSON.
+    metadata,
+    /// Matching bullet from INSIGHTS.md or CAPABILITIES.md.
+    insight,
+    /// Excerpt from a SKILL.md document.
+    skill_doc,
+};
+
+/// A single unit of information collected by the staged explain pipeline.
+/// All string fields are owned by this struct; call freeStage() to release.
+pub const Stage = struct {
+    kind: StageKind,
+    /// Content to display (prose text, code block, metadata text, etc.).
+    content: []const u8,
+    /// Origin of this stage: relative source path, skill name, or "inbox".
+    source: []const u8,
+    /// Line number within `source` (optional, for code stages).
+    line: ?u32 = null,
+};
+
+/// Free all allocations owned by a single Stage.
+pub fn freeStage(allocator: std.mem.Allocator, s: Stage) void {
+    allocator.free(s.content);
+    allocator.free(s.source);
+}
+
+/// Free a slice of Stages and all allocations they own.
+pub fn freeStages(allocator: std.mem.Allocator, stages: []const Stage) void {
+    for (stages) |s| freeStage(allocator, s);
+}
+
+// ---------------------------------------------------------------------------
+// Semantic aliases for query expansion
+// ---------------------------------------------------------------------------
+
+/// A single alias entry mapping a key to expansion values.
+pub const SemanticAlias = struct {
+    key: []const u8,
+    values: []const []const u8,
+};
+
+/// Loaded semantic aliases (owned by caller).
+pub const SemanticAliases = struct {
+    aliases: []SemanticAlias,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *@This()) void {
+        for (self.aliases) |a| {
+            self.allocator.free(a.key);
+            for (a.values) |v| self.allocator.free(v);
+            self.allocator.free(a.values);
+        }
+        self.allocator.free(self.aliases);
+    }
+
+    /// Expand query tokens using aliases. Returns owned slice of owned strings.
+    /// Caller must free the returned slice and each string.
+    pub fn expandTokens(
+        self: @This(),
+        allocator: std.mem.Allocator,
+        tokens: []const []const u8,
+    ) ![]const []const u8 {
+        var expanded: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (expanded.items) |t| allocator.free(t);
+            expanded.deinit(allocator);
+        }
+
+        var seen_lowercase: std.StringHashMapUnmanaged(void) = .{};
+        defer {
+            var it = seen_lowercase.keyIterator();
+            while (it.next()) |k| allocator.free(k.*);
+            seen_lowercase.deinit(allocator);
+        }
+
+        for (tokens) |tok| {
+            const lower = try std.ascii.allocLowerString(allocator, tok);
+            const contains_lower = seen_lowercase.contains(lower);
+            if (!contains_lower) {
+                try seen_lowercase.put(allocator, lower, {});
+            }
+            if (contains_lower) {
+                allocator.free(lower);
+                continue;
+            }
+
+            try expanded.append(allocator, try allocator.dupe(u8, tok));
+
+            for (self.aliases) |alias| {
+                if (std.ascii.eqlIgnoreCase(tok, alias.key)) {
+                    for (alias.values) |val| {
+                        const val_lower = try std.ascii.allocLowerString(allocator, val);
+                        if (seen_lowercase.contains(val_lower)) {
+                            allocator.free(val_lower);
+                            continue;
+                        }
+                        try seen_lowercase.put(allocator, val_lower, {});
+                        try expanded.append(allocator, try allocator.dupe(u8, val));
+                    }
+                }
+            }
+        }
+
+        return try expanded.toOwnedSlice(allocator);
+    }
+};
+
+/// Load semantic aliases from a JSON file.
+/// Returns null if the file does not exist or cannot be parsed.
+pub fn loadSemanticAliases(allocator: std.mem.Allocator, path: []const u8) !?SemanticAliases {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return null;
+    defer allocator.free(content);
+
+    const Value = std.json.Value;
+    var parsed = std.json.parseFromSlice(Value, allocator, content, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const aliases_arr = parsed.value.object.get("aliases") orelse return null;
+    if (aliases_arr != .array) return null;
+
+    var out: std.ArrayList(SemanticAlias) = .{};
+    errdefer {
+        for (out.items) |a| {
+            allocator.free(a.key);
+            for (a.values) |v| allocator.free(v);
+            allocator.free(a.values);
+        }
+        out.deinit(allocator);
+    }
+
+    for (aliases_arr.array.items) |item| {
+        if (item != .object) continue;
+        const key_val = item.object.get("key") orelse continue;
+        const values_val = item.object.get("values") orelse continue;
+        if (key_val != .string or values_val != .array) continue;
+
+        var vals: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (vals.items) |v| allocator.free(v);
+            vals.deinit(allocator);
+        }
+
+        for (values_val.array.items) |v| {
+            if (v == .string) {
+                try vals.append(allocator, try allocator.dupe(u8, v.string));
+            }
+        }
+
+        try out.append(allocator, .{
+            .key = try allocator.dupe(u8, key_val.string),
+            .values = try vals.toOwnedSlice(allocator),
+        });
+    }
+
+    return .{
+        .aliases = try out.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult — full set of fields from ast_nodes
 // ---------------------------------------------------------------------------
 
 pub const SearchResult = struct {
     file_path: []const u8,
+    /// Relative path to the actual source file (meta.source from guidance JSON).
+    source: []const u8,
     module: []const u8,
     node_type: []const u8,
     name: []const u8,
     signature: ?[]const u8,
     comment: ?[]const u8,
     line: ?u32,
-    /// JSON array string, e.g. `["src/foo.zig","src/bar.zig"]`.  May be null.
-    used_by: ?[]const u8,
+    /// Parsed used_by paths — owned slice; each element is owned.
+    used_by: [][]const u8,
+    language: []const u8,
     score: f64,
 };
 
 pub fn freeSearchResult(allocator: std.mem.Allocator, r: SearchResult) void {
     allocator.free(r.file_path);
+    allocator.free(r.source);
     allocator.free(r.module);
     allocator.free(r.node_type);
     allocator.free(r.name);
     if (r.signature) |s| allocator.free(s);
-    if (r.comment) |s| allocator.free(s);
-    if (r.used_by) |s| allocator.free(s);
+    if (r.comment) |cm| allocator.free(cm);
+    for (r.used_by) |ub| allocator.free(ub);
+    allocator.free(r.used_by);
+    allocator.free(r.language);
 }
 
 // ---------------------------------------------------------------------------
@@ -74,10 +263,11 @@ pub fn freeSearchResult(allocator: std.mem.Allocator, r: SearchResult) void {
 
 pub const ExplainDb = struct {
     db: ?*c.sqlite3,
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
-    /// Open an existing `.explain.db` at `db_path`.
+    /// Open an existing `.explain.db` at `db_path` for read-only access.
     /// Returns error.SqliteOpenFailed if the file does not exist or cannot be opened.
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !Self {
         if (comptime !enabled) return error.SqliteNotEnabled;
@@ -85,7 +275,6 @@ pub const ExplainDb = struct {
         const db_path_z = try allocator.dupeZ(u8, db_path);
         defer allocator.free(db_path_z);
 
-        // Open read-only to be safe; the file is owned by ast-guidance.
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open_v2(
             db_path_z.ptr,
@@ -101,9 +290,8 @@ pub const ExplainDb = struct {
 
         _ = c.sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
 
-        // Configure performance pragmas (read-only mode, so fewer options apply).
-        var self_ = Self{ .db = db };
-        try self_.configurePragmas();
+        var self_ = Self{ .db = db, .allocator = allocator };
+        self_.configurePragmas();
         return self_;
     }
 
@@ -114,7 +302,7 @@ pub const ExplainDb = struct {
         }
     }
 
-    fn configurePragmas(self: *Self) !void {
+    fn configurePragmas(self: *Self) void {
         const pragmas = [_][:0]const u8{
             "PRAGMA temp_store = MEMORY;",
             "PRAGMA cache_size = -2000;",
@@ -136,32 +324,72 @@ pub const ExplainDb = struct {
         query_text: []const u8,
         limit: usize,
     ) ![]SearchResult {
+        return self.searchWithAliases(allocator, query_text, limit, null);
+    }
+
+    /// BM25 full-text search with optional semantic alias expansion.
+    /// Caller must call `freeSearchResult` on each element and free the slice.
+    pub fn searchWithAliases(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        query_text: []const u8,
+        limit: usize,
+        aliases: ?SemanticAliases,
+    ) ![]SearchResult {
         const trimmed = std.mem.trim(u8, query_text, " \t\n\r");
         if (trimmed.len == 0) return allocator.alloc(SearchResult, 0);
 
-        // Build quoted-OR FTS5 query from whitespace-separated tokens.
-        var fts_buf: std.ArrayList(u8) = .empty;
-        defer fts_buf.deinit(allocator);
+        // Tokenize, strip trailing punctuation, filter stop words.
+        var tokens: std.ArrayList([]const u8) = .{};
+        defer {
+            for (tokens.items) |t| allocator.free(t);
+            tokens.deinit(allocator);
+        }
         var it = std.mem.tokenizeAny(u8, trimmed, " \t\n\r");
-        var first = true;
         while (it.next()) |word| {
+            var clean = word;
+            while (clean.len > 0) {
+                const last = clean[clean.len - 1];
+                if (last == '?' or last == '.' or last == ',' or last == '!' or last == ':') {
+                    clean = clean[0 .. clean.len - 1];
+                } else break;
+            }
+            if (clean.len == 0) continue;
+            if (isStopWord(clean)) continue;
+            try tokens.append(allocator, try allocator.dupe(u8, clean));
+        }
+
+        // Expand tokens with semantic aliases if available.
+        const expanded_tokens: []const []const u8 = if (aliases) |a| blk: {
+            const exp = a.expandTokens(allocator, tokens.items) catch break :blk tokens.items;
+            for (tokens.items) |t| allocator.free(t);
+            tokens.clearAndFree(allocator);
+            break :blk exp;
+        } else tokens.items;
+
+        // Build FTS5 quoted-OR query.
+        var fts_buf: std.ArrayList(u8) = .{};
+        defer fts_buf.deinit(allocator);
+        var first = true;
+        for (expanded_tokens) |tok| {
             if (!first) try fts_buf.appendSlice(allocator, " OR ");
             try fts_buf.append(allocator, '"');
-            for (word) |ch| {
-                if (ch == '"')
-                    try fts_buf.appendSlice(allocator, "\"\"")
-                else
-                    try fts_buf.append(allocator, ch);
+            for (tok) |ch| {
+                if (ch == '"') try fts_buf.appendSlice(allocator, "\"\"") else try fts_buf.append(allocator, ch);
             }
             try fts_buf.append(allocator, '"');
             first = false;
         }
-        if (fts_buf.items.len == 0) return allocator.alloc(SearchResult, 0);
-        try fts_buf.append(allocator, 0); // null-terminate for C API
+        if (fts_buf.items.len == 0) {
+            // All tokens were stop words — fall back to raw query.
+            try fts_buf.appendSlice(allocator, trimmed);
+        }
+        try fts_buf.append(allocator, 0); // null-terminate
 
         const sql =
-            "SELECT n.file_path, n.module, n.node_type, n.name, n.signature, " ++
-            "       n.comment, n.line, n.used_by, " ++
+            "SELECT n.file_path, COALESCE(n.source, ''), n.module, n.node_type, n.name," ++
+            "       n.signature, n.comment, n.line, n.used_by," ++
+            "       COALESCE(n.language, 'zig')," ++
             "       bm25(fts_search) as score " ++
             "FROM fts_search f " ++
             "JOIN ast_nodes n ON n.id = f.rowid " ++
@@ -179,7 +407,7 @@ pub const ExplainDb = struct {
 
         const fts_query = fts_buf.items[0 .. fts_buf.items.len - 1];
         _ = c.sqlite3_bind_text(stmt, 1, fts_query.ptr, @intCast(fts_query.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit * 2)); // fetch extra for reranking
 
         var results: std.ArrayList(SearchResult) = .empty;
         errdefer {
@@ -188,38 +416,131 @@ pub const ExplainDb = struct {
         }
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            const result = try readSearchResult(stmt.?, allocator);
+            const result = try readRow(stmt.?, allocator);
             try results.append(allocator, result);
         }
 
-        return results.toOwnedSlice(allocator);
+        // Rerank by node type: boost definitions, penalise tests.
+        rankByNodeType(results.items);
+
+        // Free expanded tokens if allocated by alias expansion.
+        if (aliases != null and expanded_tokens.ptr != tokens.items.ptr) {
+            for (expanded_tokens) |t| allocator.free(t);
+            allocator.free(@constCast(expanded_tokens));
+        }
+
+        // Trim to `limit`.
+        const result_slice = try results.toOwnedSlice(allocator);
+        if (result_slice.len <= limit) return result_slice;
+        for (result_slice[limit..]) |r| freeSearchResult(allocator, r);
+        @memset(result_slice[limit..], result_slice[0]);
+        const final = allocator.realloc(result_slice, limit) catch result_slice[0..limit];
+        return @constCast(final);
+    }
+
+    /// Adjust scores based on node_type: boost definitions, penalise tests.
+    fn rankByNodeType(results: []SearchResult) void {
+        for (results) |*r| {
+            if (std.mem.eql(u8, r.node_type, "struct") or
+                std.mem.eql(u8, r.node_type, "fn_decl") or
+                std.mem.eql(u8, r.node_type, "enum") or
+                std.mem.eql(u8, r.node_type, "const") or
+                std.mem.eql(u8, r.node_type, "type"))
+            {
+                r.score *= 1.5;
+            } else if (std.mem.eql(u8, r.node_type, "method") or
+                std.mem.eql(u8, r.node_type, "method_private"))
+            {
+                r.score *= 1.2;
+            } else if (std.mem.eql(u8, r.node_type, "test_decl")) {
+                r.score *= 0.3;
+            } else if (std.mem.eql(u8, r.node_type, "module")) {
+                r.score *= 0.8;
+            }
+        }
+        std.sort.block(SearchResult, results, {}, struct {
+            fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.lessThan);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Stop-word filter
+// ---------------------------------------------------------------------------
+
+/// Return true when `word` is a common English stop word that adds noise to
+/// FTS5 queries.  Case-insensitive; only checks short words (≤ 6 chars).
+fn isStopWord(word: []const u8) bool {
+    if (word.len > 6) return false;
+    var buf: [6]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..word.len], word);
+    const stops = [_][]const u8{
+        "a",    "an",   "and",  "are",  "as",   "at",   "be",   "by",
+        "do",   "for",  "get",  "has",  "how",  "i",    "if",   "in",
+        "is",   "it",   "its",  "no",   "not",  "of",   "on",   "or",
+        "our",  "out",  "so",   "the",  "to",   "use",  "used", "was",
+        "what", "when", "with", "do",   "from", "this", "that", "we",
+        "can",  "did",  "does", "does", "you",  "will", "why",  "any",
+    };
+    for (stops) |s| if (std.mem.eql(u8, lower, s)) return true;
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Column helpers
 // ---------------------------------------------------------------------------
 
-fn readSearchResult(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !SearchResult {
-    // Columns: file_path(0), module(1), node_type(2), name(3), signature(4),
-    //          comment(5), line(6), used_by(7), score(8)
+fn readRow(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !SearchResult {
+    // Columns: file_path(0), source(1), module(2), node_type(3), name(4),
+    //          signature(5), comment(6), line(7), used_by(8), language(9), score(10)
     const line_val: ?u32 = blk: {
-        if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) break :blk null;
-        const n = c.sqlite3_column_int64(stmt, 6);
+        if (c.sqlite3_column_type(stmt, 7) == c.SQLITE_NULL) break :blk null;
+        const n = c.sqlite3_column_int64(stmt, 7);
         if (n <= 0) break :blk null;
         break :blk @intCast(n);
     };
+    const used_by = try parseUsedByCol(stmt, 8, allocator);
     return SearchResult{
         .file_path = try dupeCol(stmt, 0, allocator),
-        .module = try dupeCol(stmt, 1, allocator),
-        .node_type = try dupeCol(stmt, 2, allocator),
-        .name = try dupeCol(stmt, 3, allocator),
-        .signature = try dupeColNullable(stmt, 4, allocator),
-        .comment = try dupeColNullable(stmt, 5, allocator),
+        .source = try dupeCol(stmt, 1, allocator),
+        .module = try dupeCol(stmt, 2, allocator),
+        .node_type = try dupeCol(stmt, 3, allocator),
+        .name = try dupeCol(stmt, 4, allocator),
+        .signature = try dupeColNullable(stmt, 5, allocator),
+        .comment = try dupeColNullable(stmt, 6, allocator),
         .line = line_val,
-        .used_by = try dupeColNullable(stmt, 7, allocator),
-        .score = -c.sqlite3_column_double(stmt, 8), // BM25 returns negative → flip to positive
+        .used_by = used_by,
+        .language = try dupeCol(stmt, 9, allocator),
+        .score = -c.sqlite3_column_double(stmt, 10), // BM25 returns negative → flip
     };
+}
+
+/// Parse a JSON-array column (e.g. `["a","b"]`) into an owned slice of owned strings.
+/// Returns an empty slice when the column is NULL or not a JSON array.
+fn parseUsedByCol(stmt: *c.sqlite3_stmt, col: c_int, allocator: std.mem.Allocator) ![][]const u8 {
+    if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) return &.{};
+    const raw = c.sqlite3_column_text(stmt, col);
+    if (raw == null) return &.{};
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    const json_text = @as([*]const u8, @ptrCast(raw))[0..len];
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return &.{};
+    defer parsed.deinit();
+
+    if (parsed.value != .array) return &.{};
+    const arr = parsed.value.array.items;
+    var out: std.ArrayList([]const u8) = .{};
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    for (arr) |item| {
+        if (item != .string) continue;
+        try out.append(allocator, try allocator.dupe(u8, item.string));
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn dupeCol(stmt: *c.sqlite3_stmt, col: c_int, allocator: std.mem.Allocator) ![]u8 {
@@ -255,8 +576,6 @@ pub const DbNotFound = error.DbNotFound;
 pub fn resolveDatabasePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
     // 1. Environment variable override.
     if (std.process.getEnvVarOwned(allocator, "NULLCLAW_EXPLAIN_DB")) |env_path| {
-        // Verify the file exists; if not, warn but still return the path so
-        // the caller can show a meaningful error with the explicit path.
         return env_path;
     } else |_| {}
 
@@ -289,7 +608,7 @@ fn fileExists(path: []const u8) bool {
 pub fn missingDbMessage(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        \\No .explain.db found. Run 'make explain-sync' in ast-guidance to generate it.
+        \\No .explain.db found. Run explain-gen to index your codebase.
         \\Expected locations:
         \\  - $NULLCLAW_EXPLAIN_DB  (env var, if set)
         \\  - {s}/.explain.db
@@ -330,7 +649,7 @@ pub fn parseGuidanceJson(arena: std.mem.Allocator, json_data: []const u8) !Parse
     const root_val = parsed.value;
     if (root_val != .object) return error.InvalidJson;
 
-    // ── meta ────────────────────────────────────────────────────
+    // ── meta ────────────────────────────────────────────────────────────────
     const meta_val = root_val.object.get("meta") orelse return error.MissingMeta;
     if (meta_val != .object) return error.MissingMeta;
     const module_val = meta_val.object.get("module") orelse return error.MissingModule;
@@ -343,14 +662,14 @@ pub fn parseGuidanceJson(arena: std.mem.Allocator, json_data: []const u8) !Parse
         break :blk sv.string;
     };
 
-    // ── module comment ──────────────────────────────────────────
+    // ── module comment ───────────────────────────────────────────────────────
     const comment: ?[]const u8 = blk: {
         const cv = root_val.object.get("comment") orelse break :blk null;
         if (cv != .string or cv.string.len == 0) break :blk null;
         break :blk cv.string;
     };
 
-    // ── used_by ─────────────────────────────────────────────────
+    // ── used_by ──────────────────────────────────────────────────────────────
     var used_by_list: std.ArrayList([]const u8) = .empty;
     if (root_val.object.get("used_by")) |ubv| {
         if (ubv == .array) {
@@ -362,7 +681,7 @@ pub fn parseGuidanceJson(arena: std.mem.Allocator, json_data: []const u8) !Parse
         }
     }
 
-    // ── members ─────────────────────────────────────────────────
+    // ── members ──────────────────────────────────────────────────────────────
     var members_list: std.ArrayList(ParsedMember) = .empty;
 
     const members_val = root_val.object.get("members") orelse {
@@ -515,10 +834,7 @@ test "missingDbMessage includes workspace path" {
 test "ExplainDb search on pre-built database" {
     if (comptime !enabled) return error.SkipZigTest;
 
-    // Build an in-memory SQLite database that matches the .explain.db schema.
     const allocator = std.testing.allocator;
-
-    // Create a temp file so we can use sqlite3_open_v2 in READONLY mode on it.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
@@ -527,7 +843,7 @@ test "ExplainDb search on pre-built database" {
     const db_path = try std.fmt.allocPrint(allocator, "{s}/test.explain.db", .{tmp_path});
     defer allocator.free(db_path);
 
-    // Build the schema with a write-mode connection first.
+    // Build schema with a write-mode connection.
     {
         const db_path_z = try allocator.dupeZ(u8, db_path);
         defer allocator.free(db_path_z);
@@ -539,6 +855,7 @@ test "ExplainDb search on pre-built database" {
             \\CREATE TABLE ast_nodes (
             \\  id            INTEGER PRIMARY KEY,
             \\  file_path     TEXT    NOT NULL,
+            \\  source        TEXT,
             \\  module        TEXT    NOT NULL,
             \\  node_type     TEXT    NOT NULL,
             \\  name          TEXT    NOT NULL,
@@ -546,6 +863,7 @@ test "ExplainDb search on pre-built database" {
             \\  comment       TEXT,
             \\  line          INTEGER,
             \\  used_by       TEXT,
+            \\  language      TEXT    NOT NULL DEFAULT 'zig',
             \\  last_modified INTEGER NOT NULL
             \\);
             \\CREATE VIRTUAL TABLE fts_search USING fts5(
@@ -553,10 +871,10 @@ test "ExplainDb search on pre-built database" {
             \\  content='ast_nodes',
             \\  content_rowid='id'
             \\);
-            \\INSERT INTO ast_nodes(file_path,module,node_type,name,signature,comment,line,used_by,last_modified)
-            \\  VALUES('src/parser.zig.json','src.parser','fn_decl','frobnicate',
+            \\INSERT INTO ast_nodes(file_path,source,module,node_type,name,signature,comment,line,used_by,language,last_modified)
+            \\  VALUES('src/parser.zig.json','src/parser.zig','src.parser','fn_decl','frobnicate',
             \\         'fn frobnicate(input: []const u8) !void',
-            \\         'Frobnicates the widget.',42,'["src/main.zig"]',0);
+            \\         'Frobnicates the widget.',42,'["src/main.zig"]','zig',0);
             \\INSERT INTO fts_search(rowid,name,comment,module,signature)
             \\  VALUES(1,'frobnicate','Frobnicates the widget.','src.parser','fn frobnicate(input: []const u8) !void');
         ;
@@ -578,10 +896,13 @@ test "ExplainDb search on pre-built database" {
     try std.testing.expectEqualStrings("frobnicate", results[0].name);
     try std.testing.expectEqualStrings("src.parser", results[0].module);
     try std.testing.expectEqualStrings("fn_decl", results[0].node_type);
+    try std.testing.expectEqualStrings("src/parser.zig", results[0].source);
+    try std.testing.expectEqualStrings("zig", results[0].language);
     try std.testing.expect(results[0].signature != null);
     try std.testing.expect(results[0].comment != null);
     try std.testing.expectEqual(@as(?u32, 42), results[0].line);
-    try std.testing.expect(results[0].used_by != null);
+    try std.testing.expectEqual(@as(usize, 1), results[0].used_by.len);
+    try std.testing.expectEqualStrings("src/main.zig", results[0].used_by[0]);
 }
 
 test "ExplainDb search empty query returns empty" {
@@ -604,8 +925,9 @@ test "ExplainDb search empty query returns empty" {
         var err_msg: [*c]u8 = null;
         _ = c.sqlite3_exec(db,
             \\CREATE TABLE ast_nodes(id INTEGER PRIMARY KEY,file_path TEXT NOT NULL,
-            \\  module TEXT NOT NULL,node_type TEXT NOT NULL,name TEXT NOT NULL,
-            \\  signature TEXT,comment TEXT,line INTEGER,used_by TEXT,last_modified INTEGER NOT NULL);
+            \\  source TEXT,module TEXT NOT NULL,node_type TEXT NOT NULL,name TEXT NOT NULL,
+            \\  signature TEXT,comment TEXT,line INTEGER,used_by TEXT,
+            \\  language TEXT NOT NULL DEFAULT 'zig',last_modified INTEGER NOT NULL);
             \\CREATE VIRTUAL TABLE fts_search USING fts5(name,comment,module,signature,
             \\  content='ast_nodes',content_rowid='id');
         , null, null, &err_msg);
@@ -618,4 +940,29 @@ test "ExplainDb search empty query returns empty" {
     const results = try db.search(allocator, "   ", 10);
     defer allocator.free(results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "isStopWord filters common words" {
+    try std.testing.expect(isStopWord("the"));
+    try std.testing.expect(isStopWord("is"));
+    try std.testing.expect(isStopWord("how"));
+    try std.testing.expect(!isStopWord("frobnicate"));
+    try std.testing.expect(!isStopWord("search"));
+}
+
+test "SemanticAliases expandTokens deduplicates" {
+    const allocator = std.testing.allocator;
+    var aliases = SemanticAliases{
+        .allocator = allocator,
+        .aliases = &.{},
+    };
+    defer aliases.deinit();
+
+    const tokens = [_][]const u8{ "foo", "bar" };
+    const expanded = try aliases.expandTokens(allocator, &tokens);
+    defer {
+        for (expanded) |t| allocator.free(t);
+        allocator.free(expanded);
+    }
+    try std.testing.expectEqual(@as(usize, 2), expanded.len);
 }
