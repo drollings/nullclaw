@@ -14,6 +14,8 @@ explain-gen check
 
 Config: `.explain-gen/explain-gen-config.json`
 
+---
+
 ## 1) Project Snapshot (Read First)
 
 nullclaw is a Zig-first autonomous AI assistant runtime optimized for:

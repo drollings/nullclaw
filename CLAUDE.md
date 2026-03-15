@@ -6,6 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Read `AGENTS.md` before any code change. It is the authoritative engineering protocol covering architecture, naming conventions, anti-patterns, change playbooks, and validation requirements.
 
+---
+
+## explain-gen for AST-guided code navigation (IMPORTANT!)
+
+```
+explain-gen init
+explain-gen check
+```
+
+Config: `.explain-gen/explain-gen-config.json`
+
+---
+
 ## Build & Test Commands
 
 ```bash
