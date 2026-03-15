@@ -339,6 +339,123 @@ Max notes:
 - `require_mention = true` only affects group chats. Direct messages and `bot_started` deep links still work normally.
 - Max inline buttons are one-shot in nullclaw: after a valid click, the original keyboard is cleared to avoid stale buttons.
 
+### Discord
+
+Discord example:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "accounts": {
+        "default": {
+          "token": "YOUR_DISCORD_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["YOUR_DISCORD_USER_ID"]
+        }
+      }
+    }
+  }
+}
+```
+
+Set `allow_from` explicitly unless you intentionally want an open bot. In the current Discord runtime, an omitted or empty `allow_from` list disables filtering instead of denying all inbound messages.
+
+Enable MESSAGE CONTENT INTENT in the Discord Developer Portal if you want the bot to process ordinary guild messages. Without it, Discord omits message content for most guild traffic; direct messages and messages that mention the bot still include content.
+
+Gateway intents (`intents`) is a bitmask. Default 37377 = GUILDS (1) + GUILD_MESSAGES (512) + MESSAGE_CONTENT (32768) + DIRECT_MESSAGES (4096). Calculate custom intents from https://discord.com/developers/docs/topics/gateway#gateway-intents.
+
+Discord setup flow:
+1. Create application at https://discord.com/developers/applications
+2. Bot section → Add Bot → Reset Token (copy immediately)
+3. Privileged Gateway Intents → Enable MESSAGE CONTENT INTENT → Save
+4. OAuth2 → URL Generator → Scopes: `bot`
+5. Bot Permissions: Send Messages, Read Message History, Read Messages/View Channels
+6. Copy URL, open in browser, select server, authorize
+
+The current Discord integration does not require extra OAuth scopes or elevated permissions such as `Administrator`.
+
+Multi-bot setup uses `accounts` wrapper. Each `account_id` creates an independent Discord bot connection with separate session state and routing:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "accounts": {
+        "production": {
+          "token": "PRODUCTION_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["ADMIN_USER_ID"]
+        },
+        "testing": {
+          "token": "TESTING_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["DEV_USER_ID"]
+        }
+      }
+    }
+  }
+}
+```
+
+Channel-specific bindings use `peer.kind = "channel"` with Discord channel IDs (enable Developer Mode → right-click channel → Copy ID):
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "coder",
+      "match": {
+        "channel": "discord",
+        "account_id": "default",
+        "peer": {"kind": "channel", "id": "CHANNEL_ID_HERE"}
+      }
+    }
+  ]
+}
+```
+
+Direct message bindings use `peer.kind = "direct"` with user IDs:
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "personal",
+      "match": {
+        "channel": "discord",
+        "account_id": "default",
+        "peer": {"kind": "direct", "id": "USER_ID_HERE"}
+      }
+    }
+  ]
+}
+```
+
+Parameters:
+- `token` (required) - Bot token from Discord Developer Portal
+- `intents` (default: 37377) - Gateway intents bitmask
+- `allow_bots` (default: false) - Allow messages from other bots
+- `allow_from` (default: []) - Optional allowlist of user IDs; for Discord, an omitted or empty list disables filtering, so set explicit IDs for a private bot. `["*"]` also matches all users
+- `require_mention` (default: false) - Require bot mention in guilds to respond
+- `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
+
+NullClaw splits messages >2000 characters (Discord API limit).
+
+Verification:
+```bash
+nullclaw channel start discord
+nullclaw channel status
+```
+
+`nullclaw channel start discord` starts only the first configured Discord account. For multi-account validation, run `nullclaw gateway` and send a test message to each configured bot.
+
+Common issues:
+- Bot only responds in DMs or explicit mentions: enable MESSAGE CONTENT INTENT, then re-invite the bot if needed
+- "Privileged Intents" error: enable MESSAGE CONTENT INTENT in Discord Developer Portal; verified apps may also need Discord approval
+- Bot offline: Check `nullclaw service status`, verify token hasn't been reset
+- No response in guilds: Check `require_mention` setting, verify Read Messages permission
+
 ### `memory`
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
