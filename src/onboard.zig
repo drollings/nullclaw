@@ -889,6 +889,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     // Load or create config
     var cfg = Config.load(allocator) catch try initFreshConfig(allocator);
     defer cfg.deinit();
+    try ensureSecretsEncryptionEnabled(&cfg);
 
     // Apply overrides
     var provider_overridden = false;
@@ -970,6 +971,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
     return runWizard(allocator);
 }
 
+fn ensureSecretsEncryptionEnabled(cfg: *const Config) Config.ValidationError!void {
+    if (!cfg.secrets.encrypt) {
+        return Config.ValidationError.InsecurePlaintextSecrets;
+    }
+}
+
 /// Reconfigure channels and allowlists only (preserves existing config).
 pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -984,6 +991,7 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
         return error.ConfigNotFound;
     };
     defer cfg.deinit();
+    try ensureSecretsEncryptionEnabled(&cfg);
 
     try stdout.writeAll("Channel setup wizard:\n");
     const changed = try configureChannelsInteractive(allocator, &cfg, stdout, &input_buf, "");
@@ -1491,6 +1499,8 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
 }
 
 fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    try ensureSecretsEncryptionEnabled(cfg);
+
     const nak_path = "nak";
 
     // ── Bot keypair ──────────────────────────────────────────────
@@ -1760,6 +1770,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     // Load existing or create fresh config
     var cfg = Config.load(allocator) catch try initFreshConfig(allocator);
     defer cfg.deinit();
+    try ensureSecretsEncryptionEnabled(&cfg);
 
     // ── Step 1: Provider selection ──
     try out.writeAll("  Step 1/8: Select a provider\n");
@@ -3577,6 +3588,17 @@ test "defaultModelForProvider groq" {
 
 test "defaultModelForProvider openrouter" {
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", defaultModelForProvider("openrouter"));
+}
+
+test "ensureSecretsEncryptionEnabled rejects plaintext secrets config" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.secrets.encrypt = false;
+
+    try std.testing.expectError(Config.ValidationError.InsecurePlaintextSecrets, ensureSecretsEncryptionEnabled(&cfg));
 }
 
 test "printProviderNextSteps prefers interactive chat when api key is already set" {

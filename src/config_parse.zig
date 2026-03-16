@@ -695,13 +695,37 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 const server_name = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
                 if (val != .object) continue;
-                const cmd = val.object.get("command") orelse continue;
-                if (cmd != .string) continue;
+                // `transport` is optional. If omitted, infer it from the presence of `url`.
+                // This keeps the config compatible with MCP READMEs that only specify
+                // {command,args} (stdio) or {url,headers} (http).
+                const transport_val = val.object.get("transport");
+                const transport = if (transport_val) |tv| blk: {
+                    if (tv != .string) continue;
+                    break :blk tv.string;
+                } else if (val.object.get("url") != null)
+                    types.McpServerConfig.HTTP_TRANSPORT
+                else
+                    types.McpServerConfig.DEFAULT_TRANSPORT;
+                const is_http = types.McpServerConfig.isHttpTransport(transport);
+
+                var command: []const u8 = "";
+                if (!is_http) {
+                    const cmd = val.object.get("command") orelse continue;
+                    if (cmd != .string) continue;
+                    command = cmd.string;
+                }
 
                 var mcp_cfg = types.McpServerConfig{
                     .name = try self.allocator.dupe(u8, server_name),
-                    .command = try self.allocator.dupe(u8, cmd.string),
+                    .transport = try self.allocator.dupe(u8, transport),
+                    .command = try self.allocator.dupe(u8, command),
                 };
+
+                if (val.object.get("url")) |url_val| {
+                    if (url_val == .string) {
+                        mcp_cfg.url = try self.allocator.dupe(u8, url_val.string);
+                    }
+                }
 
                 // args: string array
                 if (val.object.get("args")) |a| {
@@ -722,6 +746,29 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                         }
                         mcp_cfg.env = try env_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                // headers: object of string→string
+                if (val.object.get("headers")) |h| {
+                    if (h == .object) {
+                        var header_list: std.ArrayListUnmanaged(types.McpServerConfig.McpHeaderEntry) = .empty;
+                        var hit = h.object.iterator();
+                        while (hit.next()) |he| {
+                            if (he.value_ptr.* == .string) {
+                                try header_list.append(self.allocator, .{
+                                    .key = try self.allocator.dupe(u8, he.key_ptr.*),
+                                    .value = try self.allocator.dupe(u8, he.value_ptr.string),
+                                });
+                            }
+                        }
+                        mcp_cfg.headers = try header_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                if (val.object.get("timeout_ms")) |t| {
+                    if (t == .integer and t.integer >= 0 and t.integer <= std.math.maxInt(u32)) {
+                        mcp_cfg.timeout_ms = @intCast(t.integer);
                     }
                 }
 

@@ -1049,13 +1049,7 @@ fn runAgentJob(
         child.cwd = exec_cwd;
 
         child.spawn() catch |err| switch (err) {
-            error.FileNotFound,
-            // On macOS the kernel returns ENOEXEC (InvalidExe) when the on-disk
-            // binary was replaced while the gateway was running (in-place rebuild
-            // or redeploy).  Treat it identically to FileNotFound so we fall
-            // through to the PATH-based fallback below.
-            error.InvalidExe,
-            => {
+            error.FileNotFound => {
                 // If cwd disappeared, retry from process cwd.
                 if (exec_cwd != null and !tried_no_cwd) {
                     exec_cwd = null;
@@ -2829,5 +2823,3 @@ test "tick reschedules anchored recurring job using cron expression" {
     _ = scheduler.tick(3480, null);
     try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
 }
-
-test "cron module compiles" {}
