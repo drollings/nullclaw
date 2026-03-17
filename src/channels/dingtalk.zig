@@ -1562,6 +1562,13 @@ pub const DingTalkChannel = struct {
         return self.healthCheck();
     }
 
+    fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
+        const self: *DingTalkChannel = @ptrCast(@alignCast(ptr));
+        const template_id = self.ai_card_template_id orelse return false;
+        const streaming_key = self.ai_card_streaming_key orelse return false;
+        return template_id.len > 0 and streaming_key.len > 0;
+    }
+
     pub const vtable = root.Channel.VTable{
         .start = &vtableStart,
         .stop = &vtableStop,
@@ -1569,6 +1576,7 @@ pub const DingTalkChannel = struct {
         .sendEvent = &vtableSendEvent,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
+        .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
     };
 
     pub fn channel(self: *DingTalkChannel) root.Channel {

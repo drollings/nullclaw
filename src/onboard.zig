@@ -1136,7 +1136,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .whatsapp_web, .max => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .external, .nostr, .max => true,
         else => false,
     };
 }
@@ -1249,8 +1249,8 @@ fn configureSingleChannel(
         .slack => configureSlackChannel(cfg, out, input_buf, prefix),
         .matrix => configureMatrixChannel(cfg, out, input_buf, prefix),
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
-        .whatsapp_web => configureWhatsAppWebChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
+        .external => configureExternalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
         .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
         .max => configureMaxChannel(cfg, out, input_buf, prefix),
@@ -1294,6 +1294,52 @@ fn parseTelegramAllowFrom(allocator: std.mem.Allocator, raw: []const u8) ![]cons
     }
 
     return allow.toOwnedSlice(allocator);
+}
+
+fn parseWizardTokenList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (items.items) |entry| allocator.free(entry);
+        items.deinit(allocator);
+    }
+
+    var tokens = std.mem.tokenizeAny(u8, raw, ", \t");
+    while (tokens.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try items.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    if (items.items.len == 0) return &.{};
+    return try items.toOwnedSlice(allocator);
+}
+
+fn parseWizardJsonConfig(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return try allocator.dupe(u8, "{}");
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.InvalidJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidJson;
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+fn sanitizeStatePathSegment(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    for (trimmed) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') {
+            try buf.append(allocator, ch);
+        } else {
+            try buf.append(allocator, '_');
+        }
+    }
+    if (buf.items.len == 0) {
+        try buf.appendSlice(allocator, "default");
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 fn configureTelegramChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
@@ -1484,6 +1530,88 @@ fn configureSignalChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pr
     return true;
 }
 
+fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []const u8) !bool {
+    var account_id_buf: [128]u8 = undefined;
+    var runtime_name_buf: [128]u8 = undefined;
+    var command_buf: [512]u8 = undefined;
+    var args_buf: [512]u8 = undefined;
+    var timeout_buf: [64]u8 = undefined;
+    var config_buf: [1024]u8 = undefined;
+    var args: []const []const u8 = &.{};
+    var plugin_config_json: ?[]const u8 = null;
+    var committed = false;
+    defer {
+        if (!committed) {
+            for (args) |arg| cfg.allocator.free(arg);
+            if (args.len > 0) cfg.allocator.free(args);
+            if (plugin_config_json) |value| cfg.allocator.free(value);
+        }
+    }
+
+    try out.print("{s}  External account_id [default]: ", .{prefix});
+    const account_id = prompt(out, &account_id_buf, "", "default") orelse return false;
+
+    try out.print("{s}  External runtime_name (required, e.g. whatsapp_web): ", .{prefix});
+    const runtime_name = prompt(out, &runtime_name_buf, "", "") orelse return false;
+    if (!config_mod.ExternalChannelConfig.isValidRuntimeName(runtime_name)) {
+        try out.print("{s}  -> External skipped (invalid runtime_name)\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  External plugin command (required, Enter to skip): ", .{prefix});
+    const command = prompt(out, &command_buf, "", "") orelse return false;
+    if (command.len == 0) {
+        try out.print("{s}  -> External skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  External plugin args (optional, comma/space separated): ", .{prefix});
+    const raw_args = prompt(out, &args_buf, "", "") orelse return false;
+    args = try parseWizardTokenList(cfg.allocator, raw_args);
+
+    try out.print("{s}  External transport.timeout_ms [10000]: ", .{prefix});
+    const timeout_input = prompt(out, &timeout_buf, "", "10000") orelse return false;
+    const timeout_ms = std.fmt.parseInt(u32, timeout_input, 10) catch 10_000;
+    if (!config_mod.ExternalChannelConfig.isValidTimeoutMs(timeout_ms)) {
+        try out.print("{s}  -> External skipped (transport.timeout_ms must be in [1, 600000])\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  External config JSON (optional, object): ", .{prefix});
+    const raw_config = prompt(out, &config_buf, "", "") orelse return false;
+    plugin_config_json = parseWizardJsonConfig(cfg.allocator, raw_config) catch {
+        try out.print("{s}  -> External skipped (config JSON must be a valid object)\n", .{prefix});
+        return false;
+    };
+
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const account_segment = try sanitizeStatePathSegment(cfg.allocator, account_id);
+    defer cfg.allocator.free(account_segment);
+    const runtime_segment = try sanitizeStatePathSegment(cfg.allocator, runtime_name);
+    defer cfg.allocator.free(runtime_segment);
+
+    const accounts = try cfg.allocator.alloc(config_mod.ExternalChannelConfig, 1);
+    accounts[0] = .{
+        .account_id = try cfg.allocator.dupe(u8, account_id),
+        .runtime_name = try cfg.allocator.dupe(u8, runtime_name),
+        .transport = .{
+            .command = try cfg.allocator.dupe(u8, command),
+            .args = args,
+            .timeout_ms = timeout_ms,
+        },
+        .plugin_config_json = plugin_config_json.?,
+        .state_dir = try std.fs.path.join(cfg.allocator, &.{ config_dir, "state", "external", runtime_segment, account_segment }),
+    };
+    cfg.channels.external = accounts;
+    committed = true;
+    try out.print("{s}  -> External configured ({s}); add env vars manually in {s} if needed\n", .{
+        prefix,
+        runtime_name,
+        cfg.config_path,
+    });
+    return true;
+}
+
 fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
     try out.print("{s}  Webhook port [8080]: ", .{prefix});
     const port_input = prompt(out, input_buf, "", "8080") orelse return false;
@@ -1496,43 +1624,6 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
         .secret = if (secret_input.len > 0) try cfg.allocator.dupe(u8, secret_input) else null,
     };
     try out.print("{s}  -> Webhook configured\n", .{prefix});
-    return true;
-}
-
-fn configureWhatsAppWebChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
-    var bridge_url_buf: [512]u8 = undefined;
-    try out.print("{s}  WhatsApp Web bridge URL [http://127.0.0.1:3301]: ", .{prefix});
-    const bridge_url = prompt(out, &bridge_url_buf, "", "http://127.0.0.1:3301") orelse return false;
-    if (bridge_url.len == 0) {
-        try out.print("{s}  -> WhatsApp Web skipped\n", .{prefix});
-        return false;
-    }
-
-    try out.print("{s}  WhatsApp Web bridge API key (optional): ", .{prefix});
-    const api_key = prompt(out, input_buf, "", "") orelse return false;
-
-    try out.print("{s}  WhatsApp Web allow_from (phone IDs, comma-separated) [*]: ", .{prefix});
-    const allow_input = prompt(out, input_buf, "", "") orelse return false;
-    const allow_from = try parseTelegramAllowFrom(cfg.allocator, allow_input);
-
-    try out.print("{s}  WhatsApp Web group policy [allowlist/open/disabled] (default allowlist): ", .{prefix});
-    const group_policy_input = prompt(out, input_buf, "", "allowlist") orelse return false;
-    const group_policy = if (std.mem.eql(u8, group_policy_input, "open") or
-        std.mem.eql(u8, group_policy_input, "disabled"))
-        group_policy_input
-    else
-        "allowlist";
-
-    const accounts = try cfg.allocator.alloc(config_mod.WhatsAppWebConfig, 1);
-    accounts[0] = .{
-        .account_id = "default",
-        .bridge_url = try cfg.allocator.dupe(u8, bridge_url),
-        .api_key = if (api_key.len > 0) try cfg.allocator.dupe(u8, api_key) else null,
-        .allow_from = allow_from,
-        .group_policy = try cfg.allocator.dupe(u8, group_policy),
-    };
-    cfg.channels.whatsapp_web = accounts;
-    try out.print("{s}  -> WhatsApp Web configured\n", .{prefix});
     return true;
 }
 
@@ -2993,10 +3084,21 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.slack));
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
+    try std.testing.expect(isWizardInteractiveChannel(.external));
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
-    try std.testing.expect(isWizardInteractiveChannel(.whatsapp_web));
     try std.testing.expect(isWizardInteractiveChannel(.max));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
+}
+
+test "parseWizardJsonConfig normalizes valid object payload" {
+    const config_json = try parseWizardJsonConfig(std.testing.allocator, " { \"bridge_url\": \"http://127.0.0.1:3301\" } ");
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expectEqualStrings("{\"bridge_url\":\"http://127.0.0.1:3301\"}", config_json);
+}
+
+test "parseWizardJsonConfig rejects scalar payload" {
+    try std.testing.expectError(error.InvalidJson, parseWizardJsonConfig(std.testing.allocator, "\"nope\""));
 }
 
 test "parseTelegramAllowFrom defaults to wildcard" {

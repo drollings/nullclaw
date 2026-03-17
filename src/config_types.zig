@@ -65,9 +65,15 @@ pub const AudioMediaConfig = struct {
 // ── Sub-config structs ──────────────────────────────────────────
 
 pub const DiagnosticsConfig = struct {
+    pub const OtelHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
+    otel_headers: []const OtelHeaderEntry = &.{},
     /// Optional max length for user-visible provider/API errors after scrubbing.
     /// If null, uses env var NULLCLAW_MAX_ERROR_CHARS (or built-in default).
     api_error_max_chars: ?u32 = null,
@@ -428,27 +434,6 @@ pub const WhatsAppConfig = struct {
     group_policy: []const u8 = "allowlist",
 };
 
-pub const WhatsAppWebConfig = struct {
-    account_id: []const u8 = "default",
-    /// HTTP bridge endpoint used by the WhatsApp Web sidecar.
-    /// Example: http://127.0.0.1:3301
-    bridge_url: []const u8 = "http://127.0.0.1:3301",
-    /// Optional bearer token sent to the sidecar for API authentication.
-    api_key: ?[]const u8 = null,
-    allow_from: []const []const u8 = &.{},
-    group_allow_from: []const []const u8 = &.{},
-
-    pub fn deinit(self: *const WhatsAppWebConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.account_id);
-        allocator.free(self.bridge_url);
-        if (self.api_key) |k| allocator.free(k);
-        for (self.allow_from) |a| allocator.free(a);
-        allocator.free(self.allow_from);
-        for (self.group_allow_from) |a| allocator.free(a);
-        allocator.free(self.group_allow_from);
-    }
-};
-
 pub const IrcConfig = struct {
     account_id: []const u8 = "default",
     host: []const u8,
@@ -768,6 +753,50 @@ pub const NostrConfig = struct {
     config_dir: []const u8 = ".",
 };
 
+pub const ExternalChannelConfig = struct {
+    pub const EnvEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub const TransportConfig = struct {
+        command: []const u8 = "",
+        args: []const []const u8 = &.{},
+        env: []const EnvEntry = &.{},
+        timeout_ms: u32 = 10_000,
+    };
+
+    account_id: []const u8 = "default",
+    /// Runtime channel identifier exposed inside nullclaw routing and bindings.
+    /// Example: "whatsapp_web"
+    runtime_name: []const u8 = "",
+    /// Plugin process transport configuration (JSON-RPC over stdio).
+    transport: TransportConfig = .{},
+    /// Raw JSON object forwarded as params.config during the start request.
+    plugin_config_json: []const u8 = "{}",
+    /// Runtime-only host-owned state directory for plugin persistence.
+    /// Backfilled by Config.load(); never serialized.
+    state_dir: []const u8 = ".",
+
+    pub fn isValidRuntimeName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 128) return false;
+        for (trimmed) |ch| {
+            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') continue;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn hasCommand(raw: []const u8) bool {
+        return std.mem.trim(u8, raw, " \t\r\n").len > 0;
+    }
+
+    pub fn isValidTimeoutMs(timeout_ms: u32) bool {
+        return timeout_ms >= 1 and timeout_ms <= 600_000;
+    }
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -778,7 +807,6 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
-    whatsapp_web: []const WhatsAppWebConfig = &.{},
     teams: []const TeamsConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
@@ -791,6 +819,7 @@ pub const ChannelsConfig = struct {
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
     max: []const MaxConfig = &.{},
+    external: []const ExternalChannelConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
@@ -832,9 +861,6 @@ pub const ChannelsConfig = struct {
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
     }
-    pub fn whatsappWebPrimary(self: *const ChannelsConfig) ?WhatsAppWebConfig {
-        return primaryAccount(WhatsAppWebConfig, self.whatsapp_web);
-    }
     pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
         return primaryAccount(TeamsConfig, self.teams);
     }
@@ -867,6 +893,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn maxPrimary(self: *const ChannelsConfig) ?MaxConfig {
         return primaryAccount(MaxConfig, self.max);
+    }
+    pub fn externalPrimary(self: *const ChannelsConfig) ?ExternalChannelConfig {
+        return primaryAccount(ExternalChannelConfig, self.external);
     }
 };
 
@@ -1426,10 +1455,10 @@ pub const NamedAgentConfig = struct {
     name: []const u8,
     provider: []const u8,
     model: []const u8,
-    workspace: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     /// Runtime-only source path preserved so Config.save() can round-trip file-backed prompts.
     system_prompt_path: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
@@ -1438,15 +1467,84 @@ pub const NamedAgentConfig = struct {
 // ── MCP Server Config ──────────────────────────────────────────
 
 pub const McpServerConfig = struct {
+    pub const DEFAULT_TRANSPORT = "stdio";
+    pub const HTTP_TRANSPORT = "http";
+
     name: []const u8,
-    command: []const u8,
+    transport: []const u8 = DEFAULT_TRANSPORT,
+    command: []const u8 = "",
+    url: ?[]const u8 = null,
+    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
+    headers: []const McpHeaderEntry = &.{},
 
     pub const McpEnvEntry = struct {
         key: []const u8,
         value: []const u8,
     };
+
+    pub const McpHeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn isValidTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, DEFAULT_TRANSPORT) or std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isHttpTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, HTTP_TRANSPORT);
+    }
+
+    pub fn isValidHttpUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+
+        const host_comp = uri.host orelse return false;
+        const host = switch (host_comp) {
+            .raw => |h| h,
+            .percent_encoded => |h| blk: {
+                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+                break :blk h;
+            },
+        };
+        if (host.len == 0) return false;
+        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+        if (host[0] == ':') return false;
+
+        if (host[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            if (close != host.len - 1) return false;
+        }
+
+        if (std.mem.indexOfScalar(u8, trimmed, '#') != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    pub fn isValidHeaderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        for (trimmed) |ch| {
+            // RFC 7230 token subset; keep strict to prevent header injection.
+            if (ch <= 0x20 or ch >= 0x7f) return false;
+            if (ch == ':' or ch == '"' or ch == '\\') return false;
+        }
+        return true;
+    }
+
+    pub fn isValidHeaderValue(raw: []const u8) bool {
+        if (std.mem.indexOfAny(u8, raw, "\r\n") != null) return false;
+        return true;
+    }
 };
 
 // ── Model Pricing ──────────────────────────────────────────────
@@ -1524,6 +1622,31 @@ test "security defaults stay least-privilege" {
     try std.testing.expect(http_request.proxy == null);
     try std.testing.expect(http_request.search_base_url == null);
     try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "McpServerConfig transport validation" {
+    try std.testing.expect(McpServerConfig.isValidTransport("stdio"));
+    try std.testing.expect(McpServerConfig.isValidTransport("http"));
+    try std.testing.expect(!McpServerConfig.isValidTransport("sse"));
+}
+
+test "McpServerConfig http url validation" {
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com"));
+    try std.testing.expect(McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("http://mcp.example.com/mcp"));
+    try std.testing.expect(!McpServerConfig.isValidHttpUrl("https://mcp.example.com/mcp#frag"));
+}
+
+test "McpServerConfig timeout defaults" {
+    const cfg = McpServerConfig{ .name = "x", .command = "echo" };
+    try std.testing.expectEqual(@as(u32, 10_000), cfg.timeout_ms);
+}
+
+test "McpServerConfig header validation" {
+    try std.testing.expect(McpServerConfig.isValidHeaderName("Authorization"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderName("Bad Header"));
+    try std.testing.expect(McpServerConfig.isValidHeaderValue("Bearer token"));
+    try std.testing.expect(!McpServerConfig.isValidHeaderValue("line1\nline2"));
 }
 
 test "HttpRequestConfig proxy URL validation" {

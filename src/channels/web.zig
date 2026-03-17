@@ -120,6 +120,7 @@ pub const WebChannel = struct {
         .sendEvent = wsSendEvent,
         .name = wsName,
         .healthCheck = wsHealthCheck,
+        .supportsStreamingOutbound = wsSupportsStreamingOutbound,
     };
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.WebConfig) WebChannel {
@@ -1329,6 +1330,10 @@ pub const WebChannel = struct {
             .local => self.running.load(.acquire),
             .relay => self.running.load(.acquire) and self.relay_connected.load(.acquire),
         };
+    }
+
+    fn wsSupportsStreamingOutbound(_: *anyopaque) bool {
+        return true;
     }
 
     fn handleInboundEvent(self: *WebChannel, data: []const u8, forced_session_id: ?[]const u8) void {

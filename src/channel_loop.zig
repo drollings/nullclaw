@@ -1027,7 +1027,7 @@ pub const ChannelRuntime = struct {
     tools: []const tools_mod.Tool,
     mem_rt: ?memory_mod.MemoryRuntime,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
-    noop_obs: *observability.NoopObserver,
+    runtime_observer: *observability.RuntimeObserver,
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
@@ -1107,11 +1107,22 @@ pub const ChannelRuntime = struct {
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
-        // Noop observer (heap for vtable stability)
-        const noop_obs = try allocator.create(observability.NoopObserver);
-        errdefer allocator.destroy(noop_obs);
-        noop_obs.* = .{};
-        const obs = noop_obs.observer();
+        const runtime_observer = try observability.RuntimeObserver.create(
+            allocator,
+            .{
+                .workspace_dir = config.workspace_dir,
+                .backend = config.diagnostics.backend,
+                .otel_endpoint = config.diagnostics.otel_endpoint,
+                .otel_service_name = config.diagnostics.otel_service_name,
+            },
+            config.diagnostics.otel_headers,
+            &.{},
+        );
+        errdefer runtime_observer.destroy();
+        const obs = runtime_observer.observer();
+        if (subagent_manager) |mgr| {
+            mgr.observer = runtime_observer.backendObserver();
+        }
 
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -1127,7 +1138,7 @@ pub const ChannelRuntime = struct {
             .tools = tools,
             .mem_rt = mem_rt,
             .bootstrap_provider = bootstrap_provider,
-            .noop_obs = noop_obs,
+            .runtime_observer = runtime_observer,
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
@@ -1156,7 +1167,7 @@ pub const ChannelRuntime = struct {
         self.policy_tracker.deinit();
         alloc.destroy(self.security_policy);
         alloc.destroy(self.policy_tracker);
-        alloc.destroy(self.noop_obs);
+        self.runtime_observer.destroy();
         alloc.destroy(self);
     }
 };

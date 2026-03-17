@@ -1400,6 +1400,11 @@ pub const MaxChannel = struct {
         try self.stopTyping(recipient);
     }
 
+    fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
+        const self: *MaxChannel = @ptrCast(@alignCast(ptr));
+        return self.streaming_enabled;
+    }
+
     // ── Streaming sink (for processMessageStreaming) ──────────────
 
     pub const StreamCtx = struct {
@@ -1437,6 +1442,7 @@ pub const MaxChannel = struct {
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
     };
 
     pub fn channel(self: *MaxChannel) root.Channel {

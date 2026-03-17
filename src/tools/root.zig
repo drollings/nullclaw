@@ -59,6 +59,18 @@ pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
     return std.json.parseFromSlice(JsonValue, std.testing.allocator, json_str, .{});
 }
 
+threadlocal var tls_memory_session_id: ?[]const u8 = null;
+
+pub fn setThreadMemorySessionId(session_id: ?[]const u8) ?[]const u8 {
+    const previous = tls_memory_session_id;
+    tls_memory_session_id = session_id;
+    return previous;
+}
+
+pub fn threadMemorySessionId() ?[]const u8 {
+    return tls_memory_session_id;
+}
+
 // Sub-modules
 pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");

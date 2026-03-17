@@ -7,7 +7,6 @@
 //!   - Discord (WebSocket gateway)
 //!   - Slack (socket/http event pipeline)
 //!   - WhatsApp (webhook-based)
-//!   - WhatsApp Web (sidecar bridge polling)
 //!   - Matrix (long-polling /sync)
 //!   - Mattermost (WebSocket + REST API)
 //!   - IRC (TLS socket)
@@ -71,6 +70,9 @@ pub const Channel = struct {
 
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn defaultSupportsStreamingOutbound(_: *anyopaque) bool {
+        return false;
+    }
 
     pub const VTable = struct {
         /// Start the channel (connect, begin listening).
@@ -103,6 +105,8 @@ pub const Channel = struct {
         startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
         /// Stop processing indicator for a recipient.
         stopTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStopTyping,
+        /// Whether the channel can consume `.chunk` staged outbound events.
+        supportsStreamingOutbound: *const fn (ptr: *anyopaque) bool = &defaultSupportsStreamingOutbound,
     };
 
     pub fn start(self: Channel) !void {
@@ -149,6 +153,10 @@ pub const Channel = struct {
     pub fn stopTyping(self: Channel, recipient: []const u8) !void {
         return self.vtable.stopTyping(self.ptr, recipient);
     }
+
+    pub fn supportsStreamingOutbound(self: Channel) bool {
+        return self.vtable.supportsStreamingOutbound(self.ptr);
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -160,20 +168,6 @@ pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");
-pub const whatsapp_web = if (@import("build_options").enable_channel_whatsapp_web)
-    @import("whatsapp_web.zig")
-else
-    struct {
-        pub const WhatsAppWebChannel = struct {
-            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
-                return .{};
-            }
-            pub fn channel(_: *@This()) Channel {
-                unreachable;
-            }
-            pub fn setBus(_: *@This(), _: anytype) void {}
-        };
-    };
 pub const teams = @import("teams.zig");
 pub const matrix = @import("matrix.zig");
 pub const mattermost = @import("mattermost.zig");
@@ -188,6 +182,7 @@ pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
 pub const maixcam = @import("maixcam.zig");
 pub const signal = @import("signal.zig");
+pub const external = @import("external.zig");
 pub const web = if (@import("build_options").enable_channel_web)
     @import("web.zig")
 else

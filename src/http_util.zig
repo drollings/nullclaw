@@ -69,6 +69,12 @@ pub const HttpResponse = struct {
     body: []u8,
 };
 
+pub const HttpResponseWithHeaders = struct {
+    status_code: u16,
+    headers: []u8,
+    body: []u8,
+};
+
 /// HTTP POST via curl subprocess with optional proxy and timeout.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
@@ -255,6 +261,19 @@ pub fn curlPostWithStatus(
     body: []const u8,
     headers: []const []const u8,
 ) !HttpResponse {
+    return curlPostWithStatusAndTimeout(allocator, url, body, headers, null);
+}
+
+/// HTTP POST via curl subprocess and include HTTP status code in response,
+/// with optional --max-time timeout.
+/// Caller owns `response.body`.
+pub fn curlPostWithStatusAndTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+) !HttpResponse {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -262,6 +281,14 @@ pub fn curlPostWithStatus(
     argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
+
+    if (max_time) |mt| {
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = mt;
+        argc += 1;
+    }
+
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
@@ -355,6 +382,149 @@ pub fn curlPostWithStatus(
     return .{
         .status_code = status_code,
         .body = response_body,
+    };
+}
+
+/// HTTP POST via curl subprocess and include HTTP status code and response headers,
+/// with optional --max-time timeout.
+/// Caller owns `response.headers` and `response.body`.
+pub fn curlPostWithStatusHeadersAndTimeout(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+) !HttpResponseWithHeaders {
+    var argv_buf: [56][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+
+    if (max_time) |mt| {
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = mt;
+        argc += 1;
+    }
+
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "POST";
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "Content-Type: application/json";
+    argc += 1;
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    // Dump response headers to stdout so we can capture session IDs.
+    argv_buf[argc] = "-D";
+    argc += 1;
+    argv_buf[argc] = "-";
+    argc += 1;
+
+    argv_buf[argc] = "--data-binary";
+    argc += 1;
+    argv_buf[argc] = "@-";
+    argc += 1;
+    argv_buf[argc] = "-w";
+    argc += 1;
+    argv_buf[argc] = "\n%{http_code}";
+    argc += 1;
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
+    }
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
+    };
+    errdefer allocator.free(stdout);
+
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+    }
+
+    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
+    const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
+    if (status_raw.len != 3) return error.CurlParseError;
+    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
+
+    const payload = stdout[0..status_sep];
+    const header_end_crlf = std.mem.indexOf(u8, payload, "\r\n\r\n");
+    const header_end_lf = std.mem.indexOf(u8, payload, "\n\n");
+
+    var headers_slice: []const u8 = "";
+    var body_slice: []const u8 = payload;
+
+    if (header_end_crlf) |pos| {
+        headers_slice = payload[0..pos];
+        body_slice = payload[pos + 4 ..];
+    } else if (header_end_lf) |pos| {
+        headers_slice = payload[0..pos];
+        body_slice = payload[pos + 2 ..];
+    }
+
+    const headers_out = try allocator.dupe(u8, headers_slice);
+    errdefer allocator.free(headers_out);
+    const body_out = try allocator.dupe(u8, body_slice);
+
+    allocator.free(stdout);
+
+    return .{
+        .status_code = status_code,
+        .headers = headers_out,
+        .body = body_out,
     };
 }
 

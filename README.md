@@ -14,12 +14,13 @@
 <p align="center">
   <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
+  <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
 </p>
 
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
-Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
+Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
 678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
@@ -155,40 +156,7 @@ Then:
 nullclaw --help
 ```
 
-### 3) Optional: WhatsApp Web bridge (whatsmeow)
-
-`channels.whatsapp_web` uses an external bridge process. This repository now
-ships a reference bridge at:
-
-`examples/whatsapp-web/whatsmeow-bridge/`
-
-Build and run:
-
-```bash
-cd examples/whatsapp-web/whatsmeow-bridge
-go mod tidy
-go build -o nullclaw-whatsmeow-bridge .
-NULLCLAW_ACCOUNT_ID=default \
-NULLCLAW_BRIDGE_ADDR=127.0.0.1:3301 \
-NULLCLAW_WHATSMEOW_DB="$HOME/.local/state/nullclaw/whatsmeow.db" \
-./nullclaw-whatsmeow-bridge
-```
-
-Bridge prerequisite: Go 1.25+ (required by current whatsmeow dependency tree).
-
-Then configure the channel with onboarding and restart nullclaw:
-
-```bash
-zig build -Doptimize=ReleaseSmall -Dchannels=all,whatsapp-web
-zig-out/bin/nullclaw onboard
-zig-out/bin/nullclaw service restart
-```
-
-Full instructions (pairing + systemd user service) are in:
-
-`examples/whatsapp-web/whatsmeow-bridge/README.md`
-
-### 4) Common commands
+### 3) Common commands
 
 ```bash
 
@@ -451,7 +419,19 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   },
 
   "mcp_servers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp.example.com/rpc",
+      "timeout_ms": 10000,
+      "headers": {
+        "Authorization": "Bearer ${MCP_TOKEN}"
+      }
+    }
   },
 
   "memory": {
@@ -541,6 +521,10 @@ Example:
 In that setup, topic `42` routes to `coder`, while the rest of the forum falls back to `orchestrator`.
 
 Named agent profiles are configured separately from bindings. Bindings only choose which named agent handles a given chat/topic.
+
+If a named agent should run from its own workspace, set `agents.list[].workspace_path`.
+Relative paths are resolved from the directory that contains `config.json`, the workspace is scaffolded on first use, and the agent gets a durable memory namespace `agent:<agent-id>`.
+This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
 
 Minimal end-to-end example:
 

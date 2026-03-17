@@ -113,13 +113,14 @@ pub fn runTaskWithTools(
     };
 
     var noop_obs = observability.NoopObserver{};
+    const obs = request.observer orelse noop_obs.observer();
     var agent = try agent_mod.Agent.fromConfig(
         allocator,
         &cfg,
         provider_holder.provider(),
         tools,
         mem_opt,
-        noop_obs.observer(),
+        obs,
     );
     defer agent.deinit();
     agent.policy = &policy;

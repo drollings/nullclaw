@@ -89,23 +89,44 @@ pub fn parseAssistantChoices(allocator: std.mem.Allocator, text: []const u8) !Pa
     };
 }
 
+fn choiceCallbackDataLen(token: []const u8, option_id: []const u8) !usize {
+    if (token.len == 0) return error.InvalidCallbackData;
+    if (!isValidChoiceId(option_id)) return error.InvalidCallbackData;
+    return CALLBACK_PREFIX.len + token.len + 1 + option_id.len;
+}
+
+pub fn formatChoiceCallbackData(
+    buf: []u8,
+    token: []const u8,
+    option_id: []const u8,
+    max_len: usize,
+) ![]const u8 {
+    const needed_len = try choiceCallbackDataLen(token, option_id);
+    if (max_len > 0 and needed_len > max_len) return error.CallbackDataTooLong;
+    if (needed_len > buf.len) return error.NoSpaceLeft;
+    return std.fmt.bufPrint(buf, "{s}{s}:{s}", .{
+        CALLBACK_PREFIX,
+        token,
+        option_id,
+    });
+}
+
 pub fn buildChoiceCallbackData(
     allocator: std.mem.Allocator,
     token: []const u8,
     option_id: []const u8,
     max_len: usize,
 ) ![]u8 {
-    if (token.len == 0) return error.InvalidCallbackData;
-    if (!isValidChoiceId(option_id)) return error.InvalidCallbackData;
+    const needed_len = try choiceCallbackDataLen(token, option_id);
+    if (max_len > 0 and needed_len > max_len) return error.CallbackDataTooLong;
 
-    const encoded = try std.fmt.allocPrint(allocator, "{s}{s}:{s}", .{
+    const encoded = try allocator.alloc(u8, needed_len);
+    errdefer allocator.free(encoded);
+    _ = try std.fmt.bufPrint(encoded, "{s}{s}:{s}", .{
         CALLBACK_PREFIX,
         token,
         option_id,
     });
-    errdefer allocator.free(encoded);
-
-    if (max_len > 0 and encoded.len > max_len) return error.CallbackDataTooLong;
     return encoded;
 }
 
@@ -337,6 +358,12 @@ test "choices callback data roundtrip" {
     const parsed = parseChoiceCallbackData(encoded) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("tok1", parsed.token);
     try std.testing.expectEqualStrings("yes", parsed.option_id);
+}
+
+test "choices format callback data uses caller buffer" {
+    var buf: [64]u8 = undefined;
+    const encoded = try formatChoiceCallbackData(&buf, "tok1", "yes", 64);
+    try std.testing.expectEqualStrings("nc1:tok1:yes", encoded);
 }
 
 test "choices callback data rejects long payload" {

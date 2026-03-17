@@ -41,6 +41,7 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
     allocator.free(agent_cfg.model);
     if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
     if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+    if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
     if (agent_cfg.api_key) |api_key| allocator.free(api_key);
 }
 
@@ -167,6 +168,9 @@ fn parseNamedAgentObject(
     }
     if (item.object.get("api_key")) |ak| {
         if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
+    }
+    if (item.object.get("workspace_path")) |wp| {
+        if (wp == .string) agent_cfg.workspace_path = try allocator.dupe(u8, wp.string);
     }
     if (item.object.get("temperature")) |t| {
         if (t == .float) agent_cfg.temperature = t.float;
@@ -410,6 +414,123 @@ fn parseMultiAccountChannel(comptime T: type, allocator: std.mem.Allocator, chan
     return try list.toOwnedSlice(allocator);
 }
 
+fn parseExternalEnv(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const types.ExternalChannelConfig.EnvEntry {
+    if (value != .object) return &.{};
+
+    var entries: std.ArrayListUnmanaged(types.ExternalChannelConfig.EnvEntry) = .empty;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        try entries.append(allocator, .{
+            .key = try allocator.dupe(u8, entry.key_ptr.*),
+            .value = try allocator.dupe(u8, entry.value_ptr.string),
+        });
+    }
+
+    if (entries.items.len > 1) {
+        std.mem.sort(types.ExternalChannelConfig.EnvEntry, entries.items, {}, struct {
+            fn cmp(_: void, a: types.ExternalChannelConfig.EnvEntry, b: types.ExternalChannelConfig.EnvEntry) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.cmp);
+    }
+
+    return try entries.toOwnedSlice(allocator);
+}
+
+fn parseExternalTransportConfig(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !types.ExternalChannelConfig.TransportConfig {
+    var transport = types.ExternalChannelConfig.TransportConfig{};
+    if (value != .object) return transport;
+
+    const obj = value.object;
+    if (obj.get("command")) |command_value| {
+        if (command_value == .string) {
+            transport.command = try allocator.dupe(u8, command_value.string);
+        }
+    }
+    if (obj.get("args")) |args_value| {
+        if (args_value == .array) {
+            transport.args = try parseStringArray(allocator, args_value.array);
+        }
+    }
+    if (obj.get("env")) |env_value| {
+        transport.env = try parseExternalEnv(allocator, env_value);
+    }
+    if (obj.get("timeout_ms")) |timeout_value| {
+        if (timeout_value == .integer) {
+            if (timeout_value.integer >= 0 and timeout_value.integer <= std.math.maxInt(u32)) {
+                transport.timeout_ms = @intCast(timeout_value.integer);
+            } else {
+                transport.timeout_ms = 0;
+            }
+        } else {
+            transport.timeout_ms = 0;
+        }
+    }
+
+    return transport;
+}
+
+fn parseExternalChannelAccount(
+    self: *Config,
+    account_id: []const u8,
+    value: std.json.Value,
+) !?types.ExternalChannelConfig {
+    if (value != .object) return null;
+
+    const obj = value.object;
+
+    var parsed = types.ExternalChannelConfig{
+        .account_id = try self.allocator.dupe(u8, account_id),
+    };
+
+    if (obj.get("runtime_name")) |runtime_name_value| {
+        if (runtime_name_value == .string) {
+            parsed.runtime_name = try self.allocator.dupe(u8, runtime_name_value.string);
+        }
+    }
+    if (obj.get("transport")) |transport_value| {
+        parsed.transport = try parseExternalTransportConfig(self.allocator, transport_value);
+    }
+    if (obj.get("config")) |config_value| {
+        parsed.plugin_config_json = try std.json.Stringify.valueAlloc(self.allocator, config_value, .{});
+    } else {
+        parsed.plugin_config_json = try self.allocator.dupe(u8, parsed.plugin_config_json);
+    }
+
+    return parsed;
+}
+
+fn parseExternalChannels(self: *Config, channel_value: std.json.Value) ![]const types.ExternalChannelConfig {
+    if (channel_value != .object) return &.{};
+
+    const accounts = try getAllAccountsSorted(self.allocator, channel_value.object);
+    defer if (accounts.len > 0) self.allocator.free(accounts);
+
+    var list: std.ArrayListUnmanaged(types.ExternalChannelConfig) = .empty;
+
+    if (accounts.len == 0) {
+        if (try parseExternalChannelAccount(self, "default", channel_value)) |parsed| {
+            try list.append(self.allocator, parsed);
+        }
+        return if (list.items.len == 0) &.{} else try list.toOwnedSlice(self.allocator);
+    }
+
+    for (accounts) |account| {
+        if (try parseExternalChannelAccount(self, account.id, account.value)) |parsed| {
+            try list.append(self.allocator, parsed);
+        }
+    }
+
+    return if (list.items.len == 0) &.{} else try list.toOwnedSlice(self.allocator);
+}
+
 fn parseSingleAccountChannel(comptime T: type, allocator: std.mem.Allocator, channel_value: std.json.Value) !?T {
     if (channel_value != .object) return null;
     const selected = getPreferredAccount(channel_value.object) orelse return null;
@@ -434,39 +555,48 @@ fn parseChannels(self: *Config, channels_value: std.json.Value) !void {
 
     inline for (std.meta.fields(types.ChannelsConfig)) |field| {
         if (comptime std.mem.eql(u8, field.name, "cli")) continue;
-        if (channels_obj.get(field.name)) |channel_value| {
-            switch (@typeInfo(field.type)) {
-                .pointer => |ptr| {
-                    if (ptr.size == .slice) {
-                        const Elem = ptr.child;
-                        const parsed = try parseMultiAccountChannel(Elem, self.allocator, channel_value);
-                        if (parsed.len > 0) {
-                            @field(self.channels, field.name) = parsed;
+        if (comptime std.mem.eql(u8, field.name, "external")) {
+            if (channels_obj.get(field.name)) |channel_value| {
+                const parsed = try parseExternalChannels(self, channel_value);
+                if (parsed.len > 0) {
+                    self.channels.external = parsed;
+                }
+            }
+        } else {
+            if (channels_obj.get(field.name)) |channel_value| {
+                switch (@typeInfo(field.type)) {
+                    .pointer => |ptr| {
+                        if (ptr.size == .slice) {
+                            const Elem = ptr.child;
+                            const parsed = try parseMultiAccountChannel(Elem, self.allocator, channel_value);
+                            if (parsed.len > 0) {
+                                @field(self.channels, field.name) = parsed;
+                            }
                         }
-                    }
-                },
-                .optional => |opt| {
-                    const Child = opt.child;
-                    const info = @typeInfo(Child);
-                    if (info == .pointer and info.pointer.size == .one) {
-                        // ?*T — heap-allocated single config (e.g. NostrConfig)
-                        const Pointee = info.pointer.child;
-                        if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
-                            const ptr = try self.allocator.create(Pointee);
-                            ptr.* = parsed;
-                            @field(self.channels, field.name) = ptr;
+                    },
+                    .optional => |opt| {
+                        const Child = opt.child;
+                        const info = @typeInfo(Child);
+                        if (info == .pointer and info.pointer.size == .one) {
+                            // ?*T — heap-allocated single config (e.g. NostrConfig)
+                            const Pointee = info.pointer.child;
+                            if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
+                                const ptr = try self.allocator.create(Pointee);
+                                ptr.* = parsed;
+                                @field(self.channels, field.name) = ptr;
+                            }
+                        } else if (comptime @hasField(Child, "account_id")) {
+                            if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
+                                @field(self.channels, field.name) = parsed;
+                            }
+                        } else {
+                            if (parseInlineChannel(Child, self.allocator, channel_value)) |parsed| {
+                                @field(self.channels, field.name) = parsed;
+                            }
                         }
-                    } else if (comptime @hasField(Child, "account_id")) {
-                        if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
-                            @field(self.channels, field.name) = parsed;
-                        }
-                    } else {
-                        if (parseInlineChannel(Child, self.allocator, channel_value)) |parsed| {
-                            @field(self.channels, field.name) = parsed;
-                        }
-                    }
-                },
-                else => {},
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -695,13 +825,37 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 const server_name = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
                 if (val != .object) continue;
-                const cmd = val.object.get("command") orelse continue;
-                if (cmd != .string) continue;
+                // `transport` is optional. If omitted, infer it from the presence of `url`.
+                // This keeps the config compatible with MCP READMEs that only specify
+                // {command,args} (stdio) or {url,headers} (http).
+                const transport_val = val.object.get("transport");
+                const transport = if (transport_val) |tv| blk: {
+                    if (tv != .string) continue;
+                    break :blk tv.string;
+                } else if (val.object.get("url") != null)
+                    types.McpServerConfig.HTTP_TRANSPORT
+                else
+                    types.McpServerConfig.DEFAULT_TRANSPORT;
+                const is_http = types.McpServerConfig.isHttpTransport(transport);
+
+                var command: []const u8 = "";
+                if (!is_http) {
+                    const cmd = val.object.get("command") orelse continue;
+                    if (cmd != .string) continue;
+                    command = cmd.string;
+                }
 
                 var mcp_cfg = types.McpServerConfig{
                     .name = try self.allocator.dupe(u8, server_name),
-                    .command = try self.allocator.dupe(u8, cmd.string),
+                    .transport = try self.allocator.dupe(u8, transport),
+                    .command = try self.allocator.dupe(u8, command),
                 };
+
+                if (val.object.get("url")) |url_val| {
+                    if (url_val == .string) {
+                        mcp_cfg.url = try self.allocator.dupe(u8, url_val.string);
+                    }
+                }
 
                 // args: string array
                 if (val.object.get("args")) |a| {
@@ -722,6 +876,29 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                         }
                         mcp_cfg.env = try env_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                // headers: object of string→string
+                if (val.object.get("headers")) |h| {
+                    if (h == .object) {
+                        var header_list: std.ArrayListUnmanaged(types.McpServerConfig.McpHeaderEntry) = .empty;
+                        var hit = h.object.iterator();
+                        while (hit.next()) |he| {
+                            if (he.value_ptr.* == .string) {
+                                try header_list.append(self.allocator, .{
+                                    .key = try self.allocator.dupe(u8, he.key_ptr.*),
+                                    .value = try self.allocator.dupe(u8, he.value_ptr.string),
+                                });
+                            }
+                        }
+                        mcp_cfg.headers = try header_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                if (val.object.get("timeout_ms")) |t| {
+                    if (t == .integer and t.integer >= 0 and t.integer <= std.math.maxInt(u32)) {
+                        mcp_cfg.timeout_ms = @intCast(t.integer);
                     }
                 }
 
@@ -779,6 +956,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (otel.object.get("service_name")) |v| {
                         if (v == .string) self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (otel.object.get("headers")) |h| {
+                        if (h == .object) {
+                            var header_list: std.ArrayListUnmanaged(types.DiagnosticsConfig.OtelHeaderEntry) = .empty;
+                            var hit = h.object.iterator();
+                            while (hit.next()) |he| {
+                                if (he.value_ptr.* == .string) {
+                                    try header_list.append(self.allocator, .{
+                                        .key = try self.allocator.dupe(u8, he.key_ptr.*),
+                                        .value = try self.allocator.dupe(u8, he.value_ptr.string),
+                                    });
+                                }
+                            }
+                            self.diagnostics.otel_headers = try header_list.toOwnedSlice(self.allocator);
+                        }
                     }
                 }
             }

@@ -409,6 +409,30 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
             self.not_empty.signal();
         }
 
+        pub fn publishTimeout(self: *Self, item: T, timeout_ms: u32) error{ Closed, Timeout }!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const deadline_ns: i128 = std.time.nanoTimestamp() +
+                (@as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms);
+            while (self.len == capacity and !self.closed) {
+                const remaining_ns = remainingTimeoutNs(deadline_ns);
+                if (remaining_ns == 0) return error.Timeout;
+                self.not_full.timedWait(&self.mutex, remaining_ns) catch |err| switch (err) {
+                    error.Timeout => {
+                        if (self.len == capacity and !self.closed) return error.Timeout;
+                    },
+                };
+            }
+            if (self.closed) return error.Closed;
+
+            self.buf[self.tail] = item;
+            self.tail = (self.tail + 1) % capacity;
+            self.len += 1;
+
+            self.not_empty.signal();
+        }
+
         /// Blocks if the queue is empty. Returns null if closed and the queue is empty.
         pub fn consume(self: *Self) ?T {
             self.mutex.lock();
@@ -445,6 +469,12 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
     };
 }
 
+fn remainingTimeoutNs(deadline_ns: i128) u64 {
+    const remaining_ns = deadline_ns - std.time.nanoTimestamp();
+    if (remaining_ns <= 0) return 0;
+    return @intCast(remaining_ns);
+}
+
 // ---------------------------------------------------------------------------
 // Bus — top-level structure
 // ---------------------------------------------------------------------------
@@ -463,6 +493,10 @@ pub const Bus = struct {
 
     pub fn publishInbound(self: *Bus, msg: InboundMessage) error{Closed}!void {
         return self.inbound.publish(msg);
+    }
+
+    pub fn publishInboundTimeout(self: *Bus, msg: InboundMessage, timeout_ms: u32) error{ Closed, Timeout }!void {
+        return self.inbound.publishTimeout(msg, timeout_ms);
     }
 
     pub fn consumeInbound(self: *Bus) ?InboundMessage {

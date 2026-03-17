@@ -144,10 +144,10 @@ pub const WebFetchTool = struct {
                 "{s}\n\n[Content truncated at {d} chars, total {d} chars]",
                 .{ extracted[0..max_chars], max_chars, extracted.len },
             );
-            return ToolResult.ok(truncated);
+            return ToolResult{ .success = true, .output = truncated };
         }
 
-        return ToolResult.ok(try allocator.dupe(u8, extracted));
+        return ToolResult{ .success = true, .output = try allocator.dupe(u8, extracted) };
     }
 };
 
