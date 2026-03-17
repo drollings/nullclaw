@@ -232,6 +232,14 @@ fn defaultMaxAccount(config: *const Config, _: []const u8) ?[]const u8 {
     return null;
 }
 
+fn defaultNostrAccount(_: *const Config, _: []const u8) ?[]const u8 {
+    return "default";
+}
+
+fn deriveNostrPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routing.PeerRef {
+    return .{ .kind = .direct, .id = input.sender_id };
+}
+
 fn deriveMaxPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
     const is_group = meta.is_group orelse false;
     return .{
@@ -320,6 +328,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .channel_name = "max",
         .default_account_id = defaultMaxAccount,
         .derive_peer = deriveMaxPeer,
+    },
+    .{
+        .channel_name = "nostr",
+        .default_account_id = defaultNostrAccount,
+        .derive_peer = deriveNostrPeer,
     },
 };
 

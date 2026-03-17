@@ -2843,8 +2843,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             const conversation_context: ?yc.agent.ConversationContext = if (std.mem.eql(u8, msg.channel, "signal")) blk: {
                 break :blk .{
                     .channel = "signal",
+                    .account_id = sg.account_id,
                     .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                     .sender_uuid = msg.sender_uuid,
+                    .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                     .group_id = msg.group_id,
                     .is_group = msg.is_group,
                 };
@@ -3404,7 +3406,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             defer tg.stopTyping(typing_target) catch {};
 
             tg.setTaskReaction(msg.sender, msg.message_id, .running);
-            const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const conversation_context = yc.agent.buildConversationContext(.{
+                .channel = "telegram",
+                .account_id = tg.account_id,
+                .peer_id = msg.sender,
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) msg.sender else null,
+            });
+            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 tg.setTaskReaction(msg.sender, msg.message_id, .failed);
                 const err_msg = switch (err) {

@@ -26,6 +26,7 @@ const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 
@@ -586,19 +587,18 @@ fn buildInboundConversationContext(
     else
         null;
 
-    const has_sender_identity = meta.sender_username != null or meta.sender_display_name != null;
     const has_scope = inferred_is_group != null or group_id != null or meta.peer_id != null or meta.guild_id != null or meta.channel_id != null;
-    const has_channel = msg.channel.len > 0;
-    if (!has_channel and !has_sender_identity and !has_scope) return null;
 
-    return .{
-        .channel = if (has_channel) msg.channel else null,
-        .sender_id = if (has_sender_identity or has_scope) msg.sender_id else null,
+    return buildConversationContext(.{
+        .channel = if (msg.channel.len > 0) msg.channel else null,
+        .account_id = meta.account_id,
+        .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
+        .peer_id = meta.peer_id orelse if (has_scope) msg.chat_id else null,
         .group_id = group_id,
         .is_group = inferred_is_group,
-    };
+    });
 }
 
 fn resolveInboundRouteSessionKeyWithMetadata(
@@ -1477,6 +1477,38 @@ test "resolveInboundRouteSessionKey matches non-primary maixcam account by chann
     try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
 }
 
+test "resolveInboundRouteSessionKey routes nostr direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "nostr-dm-agent",
+            .match = .{
+                .channel = "nostr",
+                .account_id = "default",
+                .peer = .{ .kind = .direct, .id = "pubkey-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "nostr",
+        .sender_id = "pubkey-42",
+        .chat_id = "pubkey-42",
+        .content = "ping",
+        .session_key = "nostr:pubkey-42",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:nostr-dm-agent:nostr:direct:pubkey-42", routed.?);
+}
+
 test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
     const allocator = std.testing.allocator;
     const bindings = [_]agent_routing.AgentBinding{
@@ -2050,6 +2082,7 @@ test "buildInboundConversationContext preserves discord identity metadata" {
         .session_key = "discord:778899",
     };
     const context = buildInboundConversationContext(&msg, .{
+        .account_id = "discord-main",
         .guild_id = "guild-1",
         .is_dm = false,
         .sender_username = "discord-user",
@@ -2057,14 +2090,16 @@ test "buildInboundConversationContext preserves discord identity metadata" {
     }) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualStrings("discord", context.channel.?);
+    try std.testing.expectEqualStrings("discord-main", context.account_id.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("778899", context.peer_id.?);
     try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
     try std.testing.expectEqualStrings("Discord User", context.sender_display_name.?);
     try std.testing.expectEqualStrings("guild-1", context.group_id.?);
     try std.testing.expect(context.is_group.?);
 }
 
-test "buildInboundConversationContext keeps channel when metadata is absent" {
+test "buildInboundConversationContext keeps channel and sender when metadata is absent" {
     const msg = bus_mod.InboundMessage{
         .channel = "external",
         .sender_id = "user-1",
@@ -2075,7 +2110,7 @@ test "buildInboundConversationContext keeps channel when metadata is absent" {
     const context = buildInboundConversationContext(&msg, .{}) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualStrings("external", context.channel.?);
-    try std.testing.expect(context.sender_id == null);
+    try std.testing.expectEqualStrings("user-1", context.sender_id.?);
     try std.testing.expect(context.group_id == null);
     try std.testing.expect(context.is_group == null);
 }
@@ -2096,6 +2131,7 @@ test "buildInboundConversationContext uses standardized peer metadata for extern
 
     try std.testing.expectEqualStrings("external", context.channel.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.peer_id.?);
     try std.testing.expectEqualStrings("120363-room", context.group_id.?);
     try std.testing.expect(context.is_group.?);
 }

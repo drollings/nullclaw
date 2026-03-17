@@ -5429,6 +5429,33 @@ test "session config: ignores idleMinutes camelCase alias" {
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
 }
 
+test "session config: parse auto_provision_direct_agents" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"auto_provision_direct_agents": true}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.session.auto_provision_direct_agents);
+}
+
+test "session config: parse claim gate settings" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"claim_secret": "hmac-secret", "claim_admin_secret": "admin-secret", "claim_max_attempts": 7, "claim_lockout_secs": 120}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.session.claim_secret != null);
+    try std.testing.expect(cfg.session.claim_admin_secret != null);
+    try std.testing.expectEqualStrings("hmac-secret", cfg.session.claim_secret.?);
+    try std.testing.expectEqualStrings("admin-secret", cfg.session.claim_admin_secret.?);
+    try std.testing.expectEqual(@as(u32, 7), cfg.session.claim_max_attempts);
+    try std.testing.expectEqual(@as(u32, 120), cfg.session.claim_lockout_secs);
+    allocator.free(cfg.session.claim_secret.?);
+    allocator.free(cfg.session.claim_admin_secret.?);
+}
+
 test "session config: parse identity_links map format" {
     const allocator = std.testing.allocator;
     const json =
@@ -5472,6 +5499,7 @@ test "session config: empty session block uses defaults" {
     try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
     try std.testing.expectEqual(@as(usize, 0), cfg.session.identity_links.len);
+    try std.testing.expect(!cfg.session.auto_provision_direct_agents);
 }
 
 test "session config: all dm_scope values accepted" {

@@ -10,6 +10,7 @@ const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const providers = @import("providers/root.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
@@ -143,7 +144,7 @@ pub fn buildTelegramBindingStatusReply(
     const exact_binding = agent_bindings_config.findExactPeerBinding(config.agent_bindings, current_target);
     const inherited_binding = agent_bindings_config.findInheritedPeerBinding(config.agent_bindings, current_target);
 
-    const route = try agent_routing.resolveRoute(allocator, .{
+    const route = try agent_routing.resolveRouteWithSession(allocator, .{
         .channel = "telegram",
         .account_id = account_id,
         .peer = .{
@@ -157,7 +158,7 @@ pub fn buildTelegramBindingStatusReply(
             }
         else
             null,
-    }, config.agent_bindings, config.agents);
+    }, config.agent_bindings, config.agents, config.session);
     defer allocator.free(route.session_key);
     defer allocator.free(route.main_session_key);
 
@@ -383,7 +384,7 @@ fn resolveTelegramBaseRouteKey(
     var topic_peer_id: ?[]u8 = null;
     defer if (topic_peer_id) |owned| allocator.free(owned);
 
-    const route = try agent_routing.resolveRoute(allocator, .{
+    const route = try agent_routing.resolveRouteWithSession(allocator, .{
         .channel = "telegram",
         .account_id = account_id,
         .peer = .{
@@ -400,9 +401,9 @@ fn resolveTelegramBaseRouteKey(
             }
         else
             null,
-    }, config.agent_bindings, config.agents);
+    }, config.agent_bindings, config.agents, config.session);
     defer allocator.free(route.session_key);
-    allocator.free(route.main_session_key);
+    defer allocator.free(route.main_session_key);
 
     return agent_routing.buildSessionKeyWithScope(
         allocator,
@@ -749,11 +750,13 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context: ?ConversationContext = .{
+    const conversation_context = buildConversationContext(.{
         .channel = "telegram",
+        .account_id = tg_ptr.account_id,
+        .peer_id = sender,
         .is_group = is_group,
         .group_id = if (is_group) sender else null,
-    };
+    });
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -1578,13 +1581,15 @@ pub fn runSignalLoop(
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
 
             // Build conversation context for Signal
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "signal",
+                .account_id = sg_ptr.account_id,
                 .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
                 .sender_uuid = msg.sender_uuid,
+                .peer_id = if (msg.is_group) msg.group_id else msg.sender,
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
-            };
+            });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Signal agent error: {}", .{err});
@@ -1812,7 +1817,15 @@ pub fn runMatrixLoop(
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const conversation_context = buildConversationContext(.{
+                .channel = "matrix",
+                .account_id = mx_ptr.account_id,
+                .peer_id = if (msg.is_group) room_peer_id else msg.sender,
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) room_peer_id else null,
+            });
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
@@ -1945,11 +1958,13 @@ pub fn runMaxLoop(
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
 
-            const conversation_context: ?ConversationContext = .{
+            const conversation_context = buildConversationContext(.{
                 .channel = "max",
+                .account_id = mx_ptr.account_id,
+                .peer_id = if (msg.is_group) reply_target else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) reply_target else null,
-            };
+            });
 
             var stream_ctx = max_mod.MaxChannel.StreamCtx{
                 .max_ptr = mx_ptr,
@@ -2279,6 +2294,24 @@ test "resolveTelegramBaseRouteKey falls back to base telegram group binding for 
     try std.testing.expectEqualStrings("agent:group-agent:telegram:group:-100123", key);
 }
 
+test "resolveTelegramBaseRouteKey auto-provisions direct telegram peers" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .session = .{
+            .auto_provision_direct_agents = true,
+        },
+    };
+
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "123456", null, false);
+    defer allocator.free(key);
+
+    try std.testing.expect(std.mem.startsWith(u8, key, "agent:peer-"));
+    try std.testing.expect(std.mem.endsWith(u8, key, ":telegram:direct:123456"));
+}
+
 test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bindings" {
     const allocator = std.testing.allocator;
     const agents = [_]config_types.NamedAgentConfig{
@@ -2318,6 +2351,24 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
     try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);
+}
+
+test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provisioned dm" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .session = .{
+            .auto_provision_direct_agents = true,
+        },
+    };
+
+    const reply = try buildTelegramBindingStatusReply(allocator, &cfg, "main", "123456", false);
+    defer allocator.free(reply);
+
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Effective agent: peer-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: default") != null);
 }
 
 test "telegram update offset store roundtrip" {

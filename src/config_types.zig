@@ -1577,6 +1577,18 @@ pub const SessionConfig = struct {
     dm_scope: DmScope = .per_channel_peer,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
+    /// Automatically route direct messages from unknown peers into deterministic
+    /// per-peer agent IDs (agent runtime/workspace/memory isolation).
+    auto_provision_direct_agents: bool = false,
+    /// Optional HMAC secret used to verify `/claim <token>` identity assertions.
+    /// When unset, direct-peer auto-provisioning is not gated by identity claims.
+    claim_secret: ?[]const u8 = null,
+    /// Optional shared secret for manual `/revoke <admin-secret>` operations.
+    claim_admin_secret: ?[]const u8 = null,
+    /// Failed `/claim` attempts allowed before lockout kicks in.
+    claim_max_attempts: u32 = 5,
+    /// Lockout duration in seconds after too many failed claim attempts.
+    claim_lockout_secs: u32 = 300,
     typing_interval_secs: u32 = 5,
     /// Maximum concurrent message processing tasks per channel.
     /// When set to 0 or 1, messages are processed sequentially.

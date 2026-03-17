@@ -2248,6 +2248,25 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 }
                 self.session.identity_links = try link_list.toOwnedSlice(self.allocator);
             }
+            if (sess.object.get("auto_provision_direct_agents")) |v| {
+                if (v == .bool) self.session.auto_provision_direct_agents = v.bool;
+            }
+            if (sess.object.get("claim_secret")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    self.session.claim_secret = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (sess.object.get("claim_admin_secret")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    self.session.claim_admin_secret = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (sess.object.get("claim_max_attempts")) |v| {
+                if (v == .integer and v.integer > 0) self.session.claim_max_attempts = @intCast(v.integer);
+            }
+            if (sess.object.get("claim_lockout_secs")) |v| {
+                if (v == .integer and v.integer > 0) self.session.claim_lockout_secs = @intCast(v.integer);
+            }
         }
     }
 }
