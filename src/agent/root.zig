@@ -2614,9 +2614,8 @@ pub const Agent = struct {
                     } else {
                         const error_msg = result.error_msg orelse result.output;
                         const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
-                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview});
+                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
                     }
-                    
                 }
                 return .{
                     .name = call.name,

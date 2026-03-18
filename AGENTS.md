@@ -1,3 +1,16 @@
+---
+
+## explain-gen Integration
+
+This project uses explain-gen for AST-guided code navigation.
+
+```
+explain-gen init
+explain-gen check
+```
+
+Config: `.explain-gen/explain-gen-config.json`
+
 # AGENTS.md — nullclaw Agent Engineering Protocol
 
 This file defines the default working protocol for coding agents in this repository.
